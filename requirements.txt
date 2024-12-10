@@ -1,0 +1,13 @@
+flask==3.1.0
+pywebview==5.3.2
+python-dotenv==1.0.1
+markdown2==2.5.1
+PyMuPDF==1.25.0
+requests==2.32.3
+waitress==3.0.2
+llama-index==0.12.5
+llama-index-llms-ollama==0.5.0
+llama-index-embeddings-huggingface==0.4.0
+fitz==0.0.1.dev2
+Pillow==9.5.0
+imaplib2==2.45.0

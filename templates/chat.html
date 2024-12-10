@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZehnnFlow.</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="chat-page">
+    <div class="header">
+        <div class="title">ZehnnFlow.</div>
+        <div class="nav-links">
+            <a href="{{ url_for('home') }}">Home</a>
+            <a href="{{ url_for('chat') }}">Chat</a>
+            <a href="{{url_for('email_route')}}">E-mail</a>
+        </div>
+    </div>
+    <div class="chat-container">
+        <div class="greeting">Chat with Llama3 about your files</div>
+        <div id="chat-messages">
+            <div class="message ai-message">
+                <p>Llama: How can I help you today, {{username}}?</p>
+            </div>
+            {% for message in messages %}
+                {% if message.type == 'user' %}
+                    <div class="message user-message">
+                        <p>You: {{ message.content }}</p>
+                    </div>
+                {% elif message.type == 'ai' %}
+                    <div class="message ai-message">
+                        <p>Llama: {{ message.content|safe }}</p>
+                    </div>
+                {% endif %}
+            {% endfor %}
+        </div>
+        <div class="chat-input-container">
+            <form id="chat-form" action="{{ url_for('chat') }}" method="POST">
+                <input type="text" id="text-input" name="text_input" placeholder="Type your message...">
+                <button id="send-btn" type="submit">Send</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

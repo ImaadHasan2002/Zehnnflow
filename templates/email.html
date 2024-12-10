@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Client</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style2.css') }}">
+</head>
+<body>
+    <div class="header">
+        <div class="title">ZehnnFlow..</div>
+        <div class="nav-links">
+            <a href="{{url_for('home')}}">Home</a>
+            <a href="{{url_for('chat')}}">Chat</a>
+            <a href="{{url_for('email_route')}}">Email</a>
+        </div>
+    </div>
+    <div class="email-container">
+        <div class="email-list">
+            {% for email in emails %}
+            <div class="email-item">
+                <p><strong>From:</strong> {{ email.from }}</p>
+                <p><strong>Subject:</strong> {{ email.subject }}</p>
+                <p><strong>Body:</strong> {{ email.body }}</p>
+            </div>
+            {% endfor %}
+        </div>
+        <div class="email-details">
+            <h2>Draft email</h2>
+            <form class="email-form" method="POST" action="{{ url_for('email_route') }}">
+                <label>To:</label>
+                <input type="email" name="to_email" placeholder="To:" required>
+                <label>Subject:</label>
+                <input type="text" name="subject" placeholder="Subject" required>
+                <label>Body:</label>
+                <textarea name="body" placeholder="Email body..." required></textarea>
+                <button type="submit" id="send-btn">Send</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

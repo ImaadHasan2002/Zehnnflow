@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZehnnFlow.</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+</head>
+<body>
+    <div class="header">
+        <div class="title">ZehnnFlow.</div>
+        <div class="nav-links">
+            <a href="{{url_for('home')}}">Home</a>
+            <a href="{{url_for('chat')}}">Chat</a>
+            <a href="{{url_for('email_route')}}">E-mail</a>
+        </div>
+    </div>
+    <div class="container">
+        <div class="greeting">{{ greeting }}, {{ username }}</div>
+        <div class="clock" id="clock"></div>
+        <div class="todo-container">
+            <h1>Task list</h1>
+            <ul id="todo-list">
+                {% for task in tasks %}
+                    <li data-index="{{ loop.index0 }}" class="{{ 'completed' if task.completed }}">
+                        {{ task.text }}
+                        <button class="toggle-btn" style="background-color: black;color: white;border-radius: 25px;">Complete Task</button>
+                    </li>
+                {% endfor %}
+            </ul>
+            <input type="text" id="todo-input" placeholder="Add a new task...">
+            <button id="add-btn">Add</button>
+        </div>
+    </div>
+    <div id="award-visual" class="hidden">✅ Task complete!</div>
+    <div class="quote">{{ quote }}</div>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
