@@ -1,6 +1,6 @@
 # ZehnnFlow
 ZehnnFlow comes from the German word "Zehn", meaning ten, symbolizing simplicity, focus, and completion (e.g., a 10/10 productive day,some work done[1] or no work[0])
-A versatile productivity suite designed to support individuals with ADHD and neurotypicals in achieving a focused and efficient workflow.
+A versatile productivity suite designed to support individuals in achieving a focused and efficient workflow.
 
 ## Overview  
 **ZehnnFlow** is a minimalist desktop application built with [pywebview](). It provides tools to minimize distractions and optimize productivity in a clutter-free environment.  
