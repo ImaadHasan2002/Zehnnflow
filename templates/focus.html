@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>ZehnnFlow Focus</title>
+    <link rel='stylesheet' href='{{ url_for("static", filename="css/style.css") }}'>
+</head>
+<body class='app-shell focus-page'>
+    <header class='site-header'>
+        <a class='brand' href='{{ url_for("home") }}'>ZehnnFlow</a>
+        <nav class='site-nav'>
+            <a href='{{ url_for("home") }}'>Home</a>
+            <a href='{{ url_for("chat") }}'>Chat</a>
+            <a href='{{ url_for("notes") }}'>Notes</a>
+            <a class='active' href='{{ url_for("focus") }}'>Focus</a>
+            <a href='{{ url_for("email_route") }}'>Email</a>
+        </nav>
+    </header>
+
+    <main class='page-layout split-layout'>
+        <section class='panel-card music-panel'>
+            <div class='panel-header'>
+                <h1>Focus music</h1>
+                <p>Paste a YouTube URL or launch one of your quick tracks.</p>
+            </div>
+
+            <form id='resolve-track-form' class='input-row'>
+                <input id='track-url-input' type='url' placeholder='https://www.youtube.com/watch?v=...' required>
+                <button type='submit'>Load</button>
+            </form>
+            <p id='track-status' class='status-message'>
+                {% if yt_dlp_ready %}
+                    Track metadata is enriched with yt-dlp.
+                {% else %}
+                    yt-dlp is optional; playback still works with standard YouTube links.
+                {% endif %}
+            </p>
+
+            <div class='quick-track-grid' id='quick-track-grid'>
+                {% for track in tracks %}
+                    <button
+                        type='button'
+                        class='quick-track-btn'
+                        data-track-url='{{ track.url }}'
+                        data-track-title='{{ track.title }}'
+                    >
+                        {{ track.title }}
+                    </button>
+                {% endfor %}
+            </div>
+
+            <form id='save-track-form' class='input-row'>
+                <input id='save-track-title' type='text' placeholder='Track title' required>
+                <input id='save-track-url' type='url' placeholder='Track URL' required>
+                <button type='submit' class='secondary-btn'>Save track</button>
+            </form>
+        </section>
+
+        <section class='panel-card player-panel'>
+            <div class='panel-header'>
+                <h2 id='track-title'>No track loaded</h2>
+                <p id='track-meta'>Load a track to start your focus session.</p>
+            </div>
+            <div class='player-wrapper'>
+                <iframe
+                    id='focus-player'
+                    class='focus-player hidden'
+                    src=''
+                    title='Focus music player'
+                    allow='autoplay; encrypted-media; picture-in-picture'
+                    allowfullscreen
+                ></iframe>
+            </div>
+
+            <div class='timer-panel'>
+                <h3>Focus timer</h3>
+                <p id='timer-display' class='timer-display'>25:00</p>
+                <div class='button-row'>
+                    <button type='button' class='timer-preset-btn' data-minutes='25'>25m</button>
+                    <button type='button' class='timer-preset-btn' data-minutes='50'>50m</button>
+                    <button type='button' class='timer-preset-btn' data-minutes='90'>90m</button>
+                </div>
+                <div class='button-row'>
+                    <button id='start-timer-btn' type='button'>Start</button>
+                    <button id='pause-timer-btn' type='button' class='secondary-btn'>Pause</button>
+                    <button id='reset-timer-btn' type='button' class='secondary-btn'>Reset</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src='{{ url_for("static", filename="js/focus.js") }}'></script>
+</body>
+</html>

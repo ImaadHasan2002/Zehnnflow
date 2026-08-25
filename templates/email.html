@@ -1,42 +1,71 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang='en'>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Email Client</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style2.css') }}">
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>ZehnnFlow Email</title>
+    <link rel='stylesheet' href='{{ url_for("static", filename="css/style.css") }}'>
 </head>
-<body>
-    <div class="header">
-        <div class="title">ZehnnFlow..</div>
-        <div class="nav-links">
-            <a href="{{url_for('home')}}">Home</a>
-            <a href="{{url_for('chat')}}">Chat</a>
-            <a href="{{url_for('email_route')}}">Email</a>
-        </div>
-    </div>
-    <div class="email-container">
-        <div class="email-list">
-            {% for email in emails %}
-            <div class="email-item">
-                <p><strong>From:</strong> {{ email.from }}</p>
-                <p><strong>Subject:</strong> {{ email.subject }}</p>
-                <p><strong>Body:</strong> {{ email.body }}</p>
+<body class='app-shell email-page'>
+    <header class='site-header'>
+        <a class='brand' href='{{ url_for("home") }}'>ZehnnFlow</a>
+        <nav class='site-nav'>
+            <a href='{{ url_for("home") }}'>Home</a>
+            <a href='{{ url_for("chat") }}'>Chat</a>
+            <a href='{{ url_for("notes") }}'>Notes</a>
+            <a href='{{ url_for("focus") }}'>Focus</a>
+            <a class='active' href='{{ url_for("email_route") }}'>Email</a>
+        </nav>
+    </header>
+
+    <main class='page-layout split-layout'>
+        <section class='panel-card inbox-panel'>
+            <div class='panel-header'>
+                <h1>Important inbox</h1>
+                <p>Latest flagged emails so you can triage priority messages quickly.</p>
             </div>
-            {% endfor %}
-        </div>
-        <div class="email-details">
-            <h2>Draft email</h2>
-            <form class="email-form" method="POST" action="{{ url_for('email_route') }}">
-                <label>To:</label>
-                <input type="email" name="to_email" placeholder="To:" required>
-                <label>Subject:</label>
-                <input type="text" name="subject" placeholder="Subject" required>
-                <label>Body:</label>
-                <textarea name="body" placeholder="Email body..." required></textarea>
-                <button type="submit" id="send-btn">Send</button>
+
+            {% if emails %}
+                <div class='email-list'>
+                    {% for email in emails %}
+                        <article class='email-item'>
+                            <p><strong>From:</strong> {{ email.from }}</p>
+                            <p><strong>Subject:</strong> {{ email.subject }}</p>
+                            <p><strong>Body:</strong> {{ email.body[:240] }}{% if email.body|length > 240 %}...{% endif %}</p>
+                        </article>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <p class='empty-state'>No flagged emails found right now.</p>
+            {% endif %}
+        </section>
+
+        <section class='panel-card compose-panel'>
+            <div class='panel-header'>
+                <h2>Draft email</h2>
+                <p>Write and send from inside ZehnnFlow.</p>
+            </div>
+
+            {% if success %}
+                <p class='status-message success'>Email sent successfully.</p>
+            {% endif %}
+            {% if error %}
+                <p class='status-message error'>Unable to send email. Check credentials and retry.</p>
+            {% endif %}
+
+            <form class='form-stack' method='POST' action='{{ url_for("email_route") }}'>
+                <label for='to-email'>To</label>
+                <input id='to-email' type='email' name='to_email' placeholder='name@example.com' required>
+
+                <label for='email-subject'>Subject</label>
+                <input id='email-subject' type='text' name='subject' placeholder='Subject' required>
+
+                <label for='email-body'>Body</label>
+                <textarea id='email-body' name='body' placeholder='Write your message...' required></textarea>
+
+                <button type='submit' id='send-btn'>Send email</button>
             </form>
-        </div>
-    </div>
+        </section>
+    </main>
 </body>
 </html>

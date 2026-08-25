@@ -1,44 +1,84 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang='en'>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZehnnFlow.</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>ZehnnFlow Chat</title>
+    <link rel='stylesheet' href='{{ url_for("static", filename="css/style.css") }}'>
 </head>
-<body class="chat-page">
-    <div class="header">
-        <div class="title">ZehnnFlow.</div>
-        <div class="nav-links">
-            <a href="{{ url_for('home') }}">Home</a>
-            <a href="{{ url_for('chat') }}">Chat</a>
-            <a href="{{url_for('email_route')}}">E-mail</a>
-        </div>
-    </div>
-    <div class="chat-container">
-        <div class="greeting">Chat with Llama3 about your files</div>
-        <div id="chat-messages">
-            <div class="message ai-message">
-                <p>Llama: How can I help you today, {{username}}?</p>
+<body class='app-shell chat-page'>
+    <header class='site-header'>
+        <a class='brand' href='{{ url_for("home") }}'>ZehnnFlow</a>
+        <nav class='site-nav'>
+            <a href='{{ url_for("home") }}'>Home</a>
+            <a class='active' href='{{ url_for("chat") }}'>Chat</a>
+            <a href='{{ url_for("notes") }}'>Notes</a>
+            <a href='{{ url_for("focus") }}'>Focus</a>
+            <a href='{{ url_for("email_route") }}'>Email</a>
+        </nav>
+    </header>
+
+    <main class='page-layout split-layout'>
+        <section class='panel-card chat-panel'>
+            <div class='panel-header'>
+                <h1>Chat with Llama 3</h1>
+                <p>Ask questions grounded in your `data/` files and synced notes.</p>
             </div>
-            {% for message in messages %}
-                {% if message.type == 'user' %}
-                    <div class="message user-message">
-                        <p>You: {{ message.content }}</p>
+
+            <div id='chat-messages' class='chat-messages'>
+                <article class='message ai-message'>
+                    <div class='message-meta'>
+                        <span>Llama</span>
+                        <button type='button' class='speak-btn'>Read aloud</button>
                     </div>
-                {% elif message.type == 'ai' %}
-                    <div class="message ai-message">
-                        <p>Llama: {{ message.content|safe }}</p>
-                    </div>
-                {% endif %}
-            {% endfor %}
-        </div>
-        <div class="chat-input-container">
-            <form id="chat-form" action="{{ url_for('chat') }}" method="POST">
-                <input type="text" id="text-input" name="text_input" placeholder="Type your message...">
-                <button id="send-btn" type="submit">Send</button>
+                    <div class='message-body'>How can I help you today, {{ username }}?</div>
+                </article>
+
+                {% for message in messages %}
+                    {% if message.type == 'user' %}
+                        <article class='message user-message'>
+                            <div class='message-meta'><span>You</span></div>
+                            <div class='message-body'>{{ message.content }}</div>
+                        </article>
+                    {% elif message.type == 'ai' %}
+                        <article class='message ai-message'>
+                            <div class='message-meta'>
+                                <span>Llama</span>
+                                <button type='button' class='speak-btn'>Read aloud</button>
+                            </div>
+                            <div class='message-body'>{{ message.content|safe }}</div>
+                        </article>
+                    {% endif %}
+                {% endfor %}
+            </div>
+
+            <form id='chat-form' class='input-row chat-input-row' action='{{ url_for("chat") }}' method='POST'>
+                <input
+                    type='text'
+                    id='text-input'
+                    name='text_input'
+                    placeholder='Type your message...'
+                    autocomplete='off'
+                    required
+                >
+                <button id='send-btn' type='submit'>Send</button>
             </form>
-        </div>
-    </div>
+        </section>
+
+        <aside class='panel-card tts-panel'>
+            <div class='panel-header'>
+                <h2>Read-aloud support</h2>
+                <p>Useful during fatigue or deep work sessions.</p>
+            </div>
+            <label for='speech-rate'>Speech rate</label>
+            <input type='range' id='speech-rate' min='0.8' max='1.5' value='1' step='0.1'>
+            <label for='speech-pitch'>Speech pitch</label>
+            <input type='range' id='speech-pitch' min='0.8' max='1.5' value='1' step='0.1'>
+            <button id='stop-speech-btn' type='button' class='secondary-btn'>Stop reading</button>
+            <p id='tts-status' class='status-message'>Click any <em>Read aloud</em> button to hear that response.</p>
+        </aside>
+    </main>
+
+    <script src='{{ url_for("static", filename="js/chat.js") }}'></script>
 </body>
 </html>

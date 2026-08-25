@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>ZehnnFlow Notes</title>
+    <link rel='stylesheet' href='{{ url_for("static", filename="css/style.css") }}'>
+</head>
+<body class='app-shell notes-page'>
+    <header class='site-header'>
+        <a class='brand' href='{{ url_for("home") }}'>ZehnnFlow</a>
+        <nav class='site-nav'>
+            <a href='{{ url_for("home") }}'>Home</a>
+            <a href='{{ url_for("chat") }}'>Chat</a>
+            <a class='active' href='{{ url_for("notes") }}'>Notes</a>
+            <a href='{{ url_for("focus") }}'>Focus</a>
+            <a href='{{ url_for("email_route") }}'>Email</a>
+        </nav>
+    </header>
+
+    <main class='page-layout split-layout'>
+        <section class='panel-card compose-note-panel'>
+            <div class='panel-header'>
+                <h1>Integrated notes</h1>
+                <p>Every saved note is indexed for chat context, with markdown import/export for apps like OneNote.</p>
+            </div>
+
+            <form id='note-form' class='form-stack'>
+                <label for='note-title'>Title</label>
+                <input id='note-title' type='text' name='title' placeholder='Sprint retrospection'>
+
+                <label for='note-content'>Content</label>
+                <textarea id='note-content' name='content' placeholder='Write your note...' required></textarea>
+
+                <button type='submit'>Save note</button>
+            </form>
+
+            <div class='button-row'>
+                <a class='secondary-btn' href='{{ url_for("export_notes") }}'>Export markdown</a>
+                <form id='import-notes-form' class='inline-import-form' enctype='multipart/form-data'>
+                    <input id='notes-file' type='file' name='notes_file' accept='.txt,.md' required>
+                    <button type='submit' class='secondary-btn'>Import note</button>
+                </form>
+            </div>
+            <p id='notes-status' class='status-message hidden'></p>
+        </section>
+
+        <section class='panel-card notes-list-panel'>
+            <div class='panel-header'>
+                <h2>Saved notes</h2>
+                <p>Delete what is stale and keep your dataset clean.</p>
+            </div>
+
+            <div id='notes-list' class='notes-list'>
+                {% for note in notes %}
+                    <article class='note-card' data-note-id='{{ note.id }}'>
+                        <div class='note-head'>
+                            <h3>{{ note.title }}</h3>
+                            <button type='button' class='danger-btn delete-note-btn'>Delete</button>
+                        </div>
+                        <p class='note-meta'>Updated {{ note.updated_at }}</p>
+                        <p class='note-content'>{{ note.content }}</p>
+                    </article>
+                {% else %}
+                    <p class='empty-state' id='empty-notes'>No notes yet. Add your first one above.</p>
+                {% endfor %}
+            </div>
+        </section>
+    </main>
+
+    <script src='{{ url_for("static", filename="js/notes.js") }}'></script>
+</body>
+</html>

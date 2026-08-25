@@ -9,17 +9,19 @@ A versatile productivity suite designed to support individuals in achieving a fo
 - **Task Management**: Organize your day with a simple and intuitive to-do list.  
 - **AI-Powered Assistance**: Engage with an intelligent chatbot utilizing Retrieval-Augmented Generation (RAG) on custom datasets, powered by Llama3 and llama_index ([ollama]()).  
 - **Streamlined Email Client**: Check your inbox, draft messages, and send emails effortlessly in a clean, user-friendly interface.  
+- **Integrated Notes**: Save notes that are automatically indexed into the chatbot dataset.  
+- **Focus Music + Timer**: Run focus sessions with YouTube-backed ambient tracks and a built-in timer.  
+- **Read-Aloud Chat**: Use accessibility controls to read AI responses aloud.  
 
 ## Roadmap  
 Planned improvements for future versions include:  
-1. **Integrated Notes**: Seamless note-taking with automatic indexing into the chatbot’s dataset.  
-2. **Music Player**: Lightweight music player powered by YouTube-dl for enhanced focus sessions.  
-3. **Enhanced User Interface**: Improved aesthetics and usability.  
-4. **Service Integrations**: Compatibility with platforms such as OneNote.  
-5. **AI Audio Model Integration**: Incorporate AI-generated audio for text-to-speech improvement among neurodivergent folks.
+1. [x] **Integrated Notes**: Seamless note-taking with automatic indexing into the chatbot dataset.  
+2. [x] **Music Player**: Lightweight focus player with YouTube links and optional yt-dlp metadata enrichment.  
+3. [x] **Enhanced User Interface**: Improved aesthetics and usability across all pages.  
+4. [x] **Service Integrations**: Note import/export workflow for cross-tool usage (for example, OneNote markdown workflows).  
+5. [x] **AI Audio Support**: Read-aloud controls for chat responses to support accessibility needs.
 
 ## Current Challenges  
-- The email client UI requires refinement.  
 - Streamlining the distribution process for easier installation.  
 - Improving user accessibility by reducing dependencies on Python libraries.  
 
@@ -42,11 +44,12 @@ Follow these steps to set up **ZehnnFlow**:
    pip install -r requirements.txt
    ```  
 
-3. Configure environment variables by creating a `.env` file in the project directory:  
-   - `GOOGLE_APP_PASSWORD`: Your Google app password for email. (Not your Regular Password,would be a 16 digit key)
-   - `EMAIL_ADDRESS`: Your email address.  
+3. Configure environment variables by creating a `.env` file in the project directory (both lowercase and uppercase variants are supported):  
+   - `google` or `GOOGLE_APP_PASSWORD`: Your Google app password for email (16-character app password).  
+   - `email` or `EMAIL_ADDRESS`: Your email address.  
 
-4. Add custom datasets (e.g., PDFs) to the `datasets` directory. These will be indexed for chatbot interactions.  
+4. Add custom datasets (e.g., PDFs) to the `data` directory. These will be indexed for chatbot interactions.  
+   - Notes you save in the app are also synced into `data/notes/` automatically.
 
 5. Start the application:  
    ```bash

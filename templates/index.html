@@ -1,40 +1,75 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang='en'>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZehnnFlow.</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>ZehnnFlow</title>
+    <link rel='stylesheet' href='{{ url_for("static", filename="css/style.css") }}'>
 </head>
-<body>
-    <div class="header">
-        <div class="title">ZehnnFlow.</div>
-        <div class="nav-links">
-            <a href="{{url_for('home')}}">Home</a>
-            <a href="{{url_for('chat')}}">Chat</a>
-            <a href="{{url_for('email_route')}}">E-mail</a>
-        </div>
-    </div>
-    <div class="container">
-        <div class="greeting">{{ greeting }}, {{ username }}</div>
-        <div class="clock" id="clock"></div>
-        <div class="todo-container">
-            <h1>Task list</h1>
-            <ul id="todo-list">
+<body class='app-shell home-page'>
+    <header class='site-header'>
+        <a class='brand' href='{{ url_for("home") }}'>ZehnnFlow</a>
+        <nav class='site-nav'>
+            <a class='active' href='{{ url_for("home") }}'>Home</a>
+            <a href='{{ url_for("chat") }}'>Chat</a>
+            <a href='{{ url_for("notes") }}'>Notes</a>
+            <a href='{{ url_for("focus") }}'>Focus</a>
+            <a href='{{ url_for("email_route") }}'>Email</a>
+        </nav>
+    </header>
+
+    <main class='page-layout'>
+        <section class='hero-card'>
+            <p class='eyebrow'>Daily dashboard</p>
+            <h1>{{ greeting }}, {{ username }}</h1>
+            <p class='hero-subtitle'>Manage tasks, capture ideas, and keep your flow state alive.</p>
+            <div class='stats-grid'>
+                <article class='stat-card'>
+                    <p class='stat-value'>{{ pending_tasks }}</p>
+                    <p class='stat-label'>Open tasks</p>
+                </article>
+                <article class='stat-card'>
+                    <p class='stat-value'>{{ note_count }}</p>
+                    <p class='stat-label'>Saved notes</p>
+                </article>
+                <article class='stat-card'>
+                    <p id='clock' class='stat-value'>--:--</p>
+                    <p class='stat-label'>Local time</p>
+                </article>
+            </div>
+        </section>
+
+        <section class='panel-card'>
+            <div class='panel-header'>
+                <h2>Task list</h2>
+                <p>Mark items complete to keep momentum.</p>
+            </div>
+
+            <form id='todo-form' class='input-row'>
+                <input type='text' id='todo-input' placeholder='Add a new task...' autocomplete='off' required>
+                <button id='add-btn' type='submit'>Add task</button>
+            </form>
+            <p id='task-status' class='status-message hidden'></p>
+
+            <ul id='todo-list' class='task-list'>
                 {% for task in tasks %}
-                    <li data-index="{{ loop.index0 }}" class="{{ 'completed' if task.completed }}">
-                        {{ task.text }}
-                        <button class="toggle-btn" style="background-color: black;color: white;border-radius: 25px;">Complete Task</button>
+                    <li data-index='{{ loop.index0 }}' class='task-item {{ "completed" if task.completed }}'>
+                        <span class='task-text'>{{ task.text }}</span>
+                        <button type='button' class='toggle-btn'>Complete</button>
                     </li>
+                {% else %}
+                    <li class='task-empty'>No tasks yet. Start with one small win.</li>
                 {% endfor %}
             </ul>
-            <input type="text" id="todo-input" placeholder="Add a new task...">
-            <button id="add-btn">Add</button>
-        </div>
-    </div>
-    <div id="award-visual" class="hidden">✅ Task complete!</div>
-    <div class="quote">{{ quote }}</div>
-    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+        </section>
+
+        <section class='quote-card'>
+            <h2>Daily quote</h2>
+            <p>{{ quote }}</p>
+        </section>
+    </main>
+
+    <div id='award-visual' class='hidden toast-award'>Task complete ✅</div>
+    <script src='{{ url_for("static", filename="js/app.js") }}'></script>
 </body>
 </html>
