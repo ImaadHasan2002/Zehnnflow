@@ -22,7 +22,8 @@
         <section class='panel-card inbox-panel'>
             <div class='panel-header'>
                 <h1>Important inbox</h1>
-                <p>Latest flagged emails so you can triage priority messages quickly.</p>
+                <p>Latest flagged emails so you can triage priority messages quickly.
+                    <a href='{{ url_for("email_route", refresh=1) }}'>Refresh</a></p>
             </div>
 
             {% if inbox_error %}

@@ -194,3 +194,50 @@ def test_default_tracks_not_mutated(zf, client):
     before = len(zf.DEFAULT_FOCUS_TRACKS)
     assert client.post('/focus/add_track', json={'title': 'x', 'url': 'https://youtu.be/zzz'}).json['success']
     assert len(zf.DEFAULT_FOCUS_TRACKS) == before
+
+
+def test_update_task(zf, client):
+    client.post('/add_task', data={'task': 'old'})
+    assert client.post('/update_task', data={'index': '0', 'text': ' new '}).json['text'] == 'new'
+    assert zf.load_tasks()[0]['text'] == 'new'
+    assert not client.post('/update_task', data={'index': '0', 'text': '  '}).json['success']
+    assert not client.post('/update_task', data={'index': '5', 'text': 'x'}).json['success']
+
+
+def test_update_note_resyncs_dataset(zf, client):
+    note_id = client.post('/notes/add', json={'title': 'A', 'content': 'alpha'}).json['note']['id']
+    data = client.post('/notes/update', json={'note_id': note_id, 'title': 'A2', 'content': 'gamma'}).json
+    assert data['success'] and data['note']['title'] == 'A2'
+    assert 'gamma' in (zf.NOTES_DIR / f'note_{note_id}.txt').read_text()
+    assert zf.load_notes()[0]['content'] == 'gamma'
+    assert not client.post('/notes/update', json={'note_id': note_id, 'content': ' '}).json['success']
+    assert not client.post('/notes/update', json={'note_id': 'nope', 'content': 'x'}).json['success']
+
+
+def test_inbox_cached_then_refreshed(zf, client, monkeypatch):
+    calls = []
+
+    class FakeMail:
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(zf, 'login_to_email', lambda: FakeMail())
+    monkeypatch.setattr(zf, 'get_latest_emails', lambda mail: calls.append(1) or [])
+    zf.fetch_inbox()
+    zf.fetch_inbox()
+    assert len(calls) == 1          # second visit served from cache
+    client.get('/email?refresh=1')
+    assert len(calls) == 2          # refresh bypasses it
+
+
+def test_inbox_errors_are_not_cached(zf, monkeypatch):
+    attempts = []
+
+    def fail():
+        attempts.append(1)
+        raise zf.EmailError('boom')
+
+    monkeypatch.setattr(zf, 'login_to_email', fail)
+    assert zf.fetch_inbox() == ([], 'boom')
+    zf.fetch_inbox()
+    assert len(attempts) == 2

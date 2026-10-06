@@ -6,10 +6,10 @@ A versatile productivity suite designed to support individuals in achieving a fo
 **ZehnnFlow** is a minimalist desktop application built with [pywebview](). It provides tools to minimize distractions and optimize productivity in a clutter-free environment.  
 
 ## Key Features  
-- **Task Management**: Organize your day with a simple and intuitive to-do list.  
+- **Task Management**: Organize your day with a simple to-do list; double-click a task to edit it.  
 - **AI-Powered Assistance**: Engage with an intelligent chatbot utilizing Retrieval-Augmented Generation (RAG) on custom datasets, powered by Llama3 and llama_index ([ollama]()).  
-- **Streamlined Email Client**: Check your inbox, draft messages, and send emails effortlessly in a clean, user-friendly interface.  
-- **Integrated Notes**: Save notes that are automatically indexed into the chatbot dataset.  
+- **Streamlined Email Client**: Check flagged emails (cached for 60s, with a Refresh link), draft messages, and send emails in a clean interface.  
+- **Integrated Notes**: Save, edit and search notes; they are automatically re-indexed into the chatbot dataset.  
 - **Focus Music + Timer**: Run focus sessions with YouTube, SoundCloud or Spotify ambient tracks and a built-in timer.  
 - **Read-Aloud Chat**: Use accessibility controls to read AI responses aloud.  
 

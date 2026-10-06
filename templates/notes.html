@@ -48,15 +48,20 @@
         <section class='panel-card notes-list-panel'>
             <div class='panel-header'>
                 <h2>Saved notes</h2>
-                <p>Delete what is stale and keep your dataset clean.</p>
+                <p>Edit or delete notes to keep your dataset clean.</p>
             </div>
+
+            <input id='notes-search' type='search' placeholder='Search notes...' aria-label='Search notes' autocomplete='off'>
 
             <div id='notes-list' class='notes-list'>
                 {% for note in notes %}
                     <article class='note-card' data-note-id='{{ note.id }}'>
                         <div class='note-head'>
                             <h3>{{ note.title }}</h3>
-                            <button type='button' class='danger-btn delete-note-btn'>Delete</button>
+                            <span class='note-actions'>
+                                <button type='button' class='secondary-btn edit-note-btn'>Edit</button>
+                                <button type='button' class='danger-btn delete-note-btn'>Delete</button>
+                            </span>
                         </div>
                         <p class='note-meta'>Updated {{ note.updated_at }}</p>
                         <p class='note-content'>{{ note.content }}</p>

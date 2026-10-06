@@ -110,6 +110,70 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    todoListElement.addEventListener('dblclick', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || !target.classList.contains('task-text')) {
+            return;
+        }
+        const taskItem = target.closest('.task-item');
+        if (!taskItem || taskItem.querySelector('.task-edit-input')) {
+            return;
+        }
+
+        const originalText = target.textContent;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'task-edit-input';
+        input.value = originalText;
+        input.setAttribute('aria-label', 'Edit task');
+        target.classList.add('hidden');
+        target.after(input);
+        input.focus();
+        input.select();
+
+        let finished = false;
+        const finish = async (save) => {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            const newText = input.value.trim();
+            input.remove();
+            target.classList.remove('hidden');
+            if (!save || !newText || newText === originalText) {
+                return;
+            }
+            try {
+                const response = await fetch('/update_task', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    },
+                    body: new URLSearchParams({ index: taskItem.dataset.index || '', text: newText }),
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    renderStatus(data.error || 'Unable to update task.', 'error');
+                    return;
+                }
+                target.textContent = data.text;
+                renderStatus('Task updated.', 'success');
+            } catch (_error) {
+                renderStatus('Network issue while updating task.', 'error');
+            }
+        };
+
+        input.addEventListener('keydown', (keyEvent) => {
+            if (keyEvent.key === 'Enter') {
+                keyEvent.preventDefault();
+                finish(true);
+            } else if (keyEvent.key === 'Escape') {
+                finish(false);
+            }
+        });
+        input.addEventListener('blur', () => finish(true));
+    });
+
     todoListElement.addEventListener('click', async (event) => {
         const target = event.target;
         if (!(target instanceof HTMLButtonElement) || !target.classList.contains('toggle-btn')) {

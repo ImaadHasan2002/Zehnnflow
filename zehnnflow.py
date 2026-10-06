@@ -6,6 +6,7 @@ import os
 import smtplib
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from email.header import decode_header, make_header
@@ -162,21 +163,37 @@ def get_latest_emails(mail, count=5):
         print(f"Important email retrieval error: {e}")
         raise EmailError('Could not read your inbox right now. Retry in a moment.')
 
-def fetch_inbox():
-    """Return (emails, error_message); closes the IMAP session either way."""
-    try:
-        mail = login_to_email()
-    except EmailError as e:
-        return [], str(e)
-    try:
-        return get_latest_emails(mail), None
-    except EmailError as e:
-        return [], str(e)
-    finally:
+INBOX_CACHE_SECONDS = 60
+_inbox_cache = {'at': 0.0, 'emails': None}
+_inbox_lock = threading.Lock()
+
+def fetch_inbox(force=False):
+    """Return (emails, error_message), cached for INBOX_CACHE_SECONDS.
+
+    Only successful fetches are cached, so an error is retried on the next visit.
+    ``force=True`` (the Refresh button) bypasses the cache.
+    """
+    with _inbox_lock:
+        fresh = time.monotonic() - _inbox_cache['at'] < INBOX_CACHE_SECONDS
+        if not force and fresh and _inbox_cache['emails'] is not None:
+            return _inbox_cache['emails'], None
+
         try:
-            mail.logout()
-        except Exception:
-            pass
+            mail = login_to_email()
+        except EmailError as e:
+            return [], str(e)
+        try:
+            emails = get_latest_emails(mail)
+        except EmailError as e:
+            return [], str(e)
+        finally:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+        _inbox_cache.update(at=time.monotonic(), emails=emails)
+        return emails, None
 
 # Helper function to extract email body
 def extract_email_body(email_message):
@@ -220,7 +237,7 @@ def email_route():
             except EmailError as e:
                 context['send_error'] = str(e)
 
-    emails, inbox_error = fetch_inbox()
+    emails, inbox_error = fetch_inbox(force=request.args.get('refresh') == '1')
     return render_template('email.html', emails=emails, inbox_error=inbox_error, **context)
 
 def ensure_app_directories():
@@ -539,6 +556,26 @@ def toggle_task():
         print(f"Toggle task error: {e}")
         return jsonify(success=False, error='Unable to update task.')
 
+@app.route('/update_task', methods=['POST'])
+def update_task():
+    try:
+        index = int(request.form['index'])
+        text = request.form.get('text', '').strip()
+        if not text:
+            return jsonify(success=False, error='Task cannot be empty.')
+
+        with STORE_LOCK:
+            tasks = load_tasks()
+            if index < 0 or index >= len(tasks):
+                return jsonify(success=False, error='Task index out of range.')
+            tasks[index]['text'] = text
+            if not save_tasks(tasks):
+                return jsonify(success=False, error='Unable to update task.')
+        return jsonify(success=True, text=text)
+    except Exception as e:
+        print(f"Update task error: {e}")
+        return jsonify(success=False, error='Unable to update task.')
+
 @app.route('/notes')
 def notes():
     notes_data = load_notes()
@@ -561,6 +598,35 @@ def add_note():
         return jsonify(success=True, note=note)
     except Exception as e:
         print(f"Note add error: {e}")
+        return jsonify(success=False, error='Unable to save note.')
+
+@app.route('/notes/update', methods=['POST'])
+def update_note():
+    try:
+        payload = request.get_json(silent=True) or {}
+        note_id = payload.get('note_id', '')
+        title = str(payload.get('title', '')).strip()
+        content = str(payload.get('content', '')).strip()
+        if not note_id:
+            return jsonify(success=False, error='Invalid note id.')
+        if not content:
+            return jsonify(success=False, error='Note content cannot be empty.')
+
+        with STORE_LOCK:
+            notes_data = load_notes()
+            note = next((item for item in notes_data if item.get('id') == note_id), None)
+            if note is None:
+                return jsonify(success=False, error='Note not found.')
+
+            note['title'] = title or note.get('title') or 'Untitled note'
+            note['content'] = content
+            note['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+            if not save_notes(notes_data):
+                return jsonify(success=False, error='Unable to save note.')
+            sync_note_to_dataset(note)
+        return jsonify(success=True, note=note)
+    except Exception as e:
+        print(f"Note update error: {e}")
         return jsonify(success=False, error='Unable to save note.')
 
 @app.route('/notes/delete', methods=['POST'])
