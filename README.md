@@ -10,7 +10,7 @@ A versatile productivity suite designed to support individuals in achieving a fo
 - **AI-Powered Assistance**: Engage with an intelligent chatbot utilizing Retrieval-Augmented Generation (RAG) on custom datasets, powered by Llama3 and llama_index ([ollama]()).  
 - **Streamlined Email Client**: Check your inbox, draft messages, and send emails effortlessly in a clean, user-friendly interface.  
 - **Integrated Notes**: Save notes that are automatically indexed into the chatbot dataset.  
-- **Focus Music + Timer**: Run focus sessions with YouTube-backed ambient tracks and a built-in timer.  
+- **Focus Music + Timer**: Run focus sessions with YouTube, SoundCloud or Spotify ambient tracks and a built-in timer.  
 - **Read-Aloud Chat**: Use accessibility controls to read AI responses aloud.  
 
 ## Roadmap  
@@ -49,11 +49,22 @@ Follow these steps to set up **ZehnnFlow**:
    - `email` or `EMAIL_ADDRESS`: Your email address.  
 
 4. Add custom datasets (e.g., PDFs) to the `data` directory. These will be indexed for chatbot interactions.  
-   - Notes you save in the app are also synced into `data/notes/` automatically.
+   - Notes you save in the app are also synced into `data/notes/` automatically (`notes.json` is the source of truth; stray files in `data/notes/` are removed on sync).
+   - Only `.txt`, `.md` and `.pdf` files are indexed.
 
 5. Start the application:  
    ```bash
-   python zehnnflow.py
+   python zehnnflow.py                 # desktop window (pywebview)
+   python zehnnflow.py --web           # plain web server on http://127.0.0.1:5000
+   python zehnnflow.py --web --host 0.0.0.0 --port 8080
+   ```  
+   Startup only creates folders. PDF text extraction, note syncing and chat indexing happen on the first chat message, and the index is cached until the files in `data/` change.
+
+   Optional settings: `ZEHNNFLOW_HOME` (where `data/`, `notes.json`, `tasks.json` live), `ZEHNNFLOW_LLM_MODEL` (default `llama3`), `ZEHNNFLOW_EMBED_MODEL`.
+
+6. Run the tests:  
+   ```bash
+   pip install pytest && pytest
    ```  
 
 ## Contribution  

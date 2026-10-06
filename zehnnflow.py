@@ -1,29 +1,29 @@
-import os
-import json
-import uuid
-import imaplib
+import argparse
 import email
+import imaplib
+import json
+import os
 import smtplib
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+import tempfile
+import threading
+import uuid
 from datetime import datetime
-from getpass import getuser
-from email.header import decode_header
+from email.header import decode_header, make_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from getpass import getuser
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-import fitz
 import requests
-import webview
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from markdown2 import markdown
+from markupsafe import escape
 
-# Llama Index Imports
-from llama_index.core import VectorStoreIndex, Settings
-from llama_index.core.readers import SimpleDirectoryReader
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.ollama import Ollama
+# Heavy / optional dependencies (llama_index, pymupdf, pywebview) are imported
+# lazily inside the functions that need them, so importing this module (for a
+# web deployment or tests) stays fast and does not require every extra.
 
 try:
     import yt_dlp
@@ -36,11 +36,23 @@ load_dotenv()
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / 'data'
+# Where user data lives. Defaults to the project folder; override with
+# ZEHNNFLOW_HOME to keep data elsewhere (hosting, tests).
+HOME_DIR = Path(os.getenv('ZEHNNFLOW_HOME') or BASE_DIR).resolve()
+DATA_DIR = HOME_DIR / 'data'
 NOTES_DIR = DATA_DIR / 'notes'
-TASKS_FILE = BASE_DIR / 'tasks.json'
-NOTES_FILE = BASE_DIR / 'notes.json'
-TRACKS_FILE = BASE_DIR / 'tracks.json'
+TASKS_FILE = HOME_DIR / 'tasks.json'
+NOTES_FILE = HOME_DIR / 'notes.json'
+TRACKS_FILE = HOME_DIR / 'tracks.json'
+
+# Guards read-modify-write cycles on the JSON stores (waitress is multi-threaded).
+STORE_LOCK = threading.RLock()
+
+LLM_MODEL = os.getenv('ZEHNNFLOW_LLM_MODEL', 'llama3')
+EMBED_MODEL = os.getenv('ZEHNNFLOW_EMBED_MODEL', 'BAAI/bge-base-en-v1.5')
+# Only these file types are indexed; PDFs are indexed through their extracted
+# .txt twin, so they are never embedded twice.
+INDEXED_EXTENSIONS = ('.txt', '.md')
 
 DEFAULT_FOCUS_TRACKS = [
     {
@@ -62,208 +74,233 @@ def get_email_credentials():
     app_password = os.getenv('google') or os.getenv('GOOGLE_APP_PASSWORD') or ''
     return email_address, app_password
 
+class EmailError(Exception):
+    """An email problem with a message that is safe to show to the user."""
+
+MISSING_CREDENTIALS_MESSAGE = (
+    'Email is not set up yet. Add EMAIL_ADDRESS and GOOGLE_APP_PASSWORD '
+    '(a Gmail app password) to your .env file, then restart ZehnnFlow.'
+)
+
 # Function to send an email
 def send_email(to_email, subject, body):
+    """Send a message through Gmail SMTP. Raises EmailError with a friendly message."""
+    from_email, password = get_email_credentials()
+    if not from_email or not password:
+        raise EmailError(MISSING_CREDENTIALS_MESSAGE)
+
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
     try:
-        from_email, password = get_email_credentials()
-        if not from_email or not password:
-            print('Missing email credentials in environment variables.')
-            return False
-
-        msg = MIMEMultipart()
-        msg['From'] = from_email
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as server:
             server.starttls()
             server.login(from_email, password)
             server.sendmail(from_email, to_email, msg.as_string())
-        
-        return True
-    except Exception as e:
+    except smtplib.SMTPAuthenticationError:
+        raise EmailError('Gmail rejected the login. Check that you are using an app password, not your normal password.')
+    except smtplib.SMTPRecipientsRefused:
+        raise EmailError('The recipient address was refused. Check the "To" address.')
+    except (smtplib.SMTPException, OSError) as e:
         print(f"Email sending error: {e}")
-        return False
+        raise EmailError('Could not reach Gmail to send the message. Check your connection and retry.')
+
+# Function to login to email
+def login_to_email():
+    """Open an IMAP session. Raises EmailError with a friendly message."""
+    email_address, app_password = get_email_credentials()
+    if not email_address or not app_password:
+        raise EmailError(MISSING_CREDENTIALS_MESSAGE)
+
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993, timeout=15)
+        mail.login(email_address, app_password)
+        return mail
+    except imaplib.IMAP4.error:
+        raise EmailError('Gmail rejected the login. Check that IMAP is enabled and that you are using an app password.')
+    except OSError as e:
+        print(f"Email login error: {e}")
+        raise EmailError('Could not reach Gmail. Check your connection and retry.')
+
+def decode_mime_header(value):
+    """Decode an RFC 2047 header (all encoded words) to text; tolerate missing headers."""
+    if not value:
+        return ''
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return str(value)
+
+def get_latest_emails(mail, count=5):
+    """Return the most recent flagged emails, newest first. Raises EmailError on IMAP failure."""
+    try:
+        mail.select('INBOX', readonly=True)
+        status, flagged_messages = mail.search(None, 'FLAGGED')
+        if status != 'OK':
+            raise EmailError('Gmail could not search your inbox.')
+
+        flagged_ids = flagged_messages[0].split()
+        emails = []
+        for email_id in reversed(flagged_ids[-count:]):  # newest first
+            status, msg = mail.fetch(email_id, '(RFC822)')
+            if status != 'OK' or not msg or not msg[0]:
+                continue
+            email_message = email.message_from_bytes(msg[0][1])
+            emails.append({
+                'from': decode_mime_header(email_message['From']),
+                'subject': decode_mime_header(email_message['Subject']) or '(no subject)',
+                'body': extract_email_body(email_message),
+                'is_important': True,
+            })
+        return emails
+    except EmailError:
+        raise
+    except (imaplib.IMAP4.error, OSError) as e:
+        print(f"Important email retrieval error: {e}")
+        raise EmailError('Could not read your inbox right now. Retry in a moment.')
+
+def fetch_inbox():
+    """Return (emails, error_message); closes the IMAP session either way."""
+    try:
+        mail = login_to_email()
+    except EmailError as e:
+        return [], str(e)
+    try:
+        return get_latest_emails(mail), None
+    except EmailError as e:
+        return [], str(e)
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+# Helper function to extract email body
+def extract_email_body(email_message):
+    """Prefer the text/plain part; fall back to text/html. Uses the part's own charset."""
+    def decode_part(part):
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ''
+        return payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
+
+    try:
+        parts = email_message.walk() if email_message.is_multipart() else [email_message]
+        fallback = ''
+        for part in parts:
+            content_type = part.get_content_type()
+            if part.get_content_disposition() == 'attachment':
+                continue
+            if content_type == 'text/plain':
+                return decode_part(part)
+            if content_type == 'text/html' and not fallback:
+                fallback = decode_part(part)
+        return fallback
+    except Exception as e:
+        print(f"Email body extraction error: {e}")
+        return ''
 
 # Route for handling email sending
 @app.route('/email', methods=['GET', 'POST'])
 def email_route():
-    try:
-        if request.method == 'POST':
-            to_email = request.form['to_email']
-            subject = request.form['subject']
-            body = request.form['body']
-            
-            if send_email(to_email, subject, body):
-                mail = login_to_email()
-                emails = get_latest_emails(mail)
-                return render_template('email.html', emails=emails, success=True)
-            else:
-                return render_template('email.html', error=True)
-        
-        mail = login_to_email()
-        emails = get_latest_emails(mail)
-        return render_template('email.html', emails=emails)
-    except Exception as e:
-        print(f"Email route error: {e}")
-        return render_template('email.html', error=True)
-
-# Function to login to email
-def login_to_email():
-    try:
-        email_address, app_password = get_email_credentials()
-        if not email_address or not app_password:
-            print('Missing email credentials in environment variables.')
-            return None
-
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(email_address, app_password)
-        return mail
-    except Exception as e:
-        print(f"Email login error: {e}")
-        return None
-
-# Function to get the latest emails
-def get_latest_emails(mail, count=5):
-    try:
-        if not mail:
-            return []
-        
-        # Specifically search for ONLY flagged (important) emails
-        mail.select('INBOX')
-        status, flagged_messages = mail.search(None, 'FLAGGED')
-        flagged_messages = flagged_messages[0].split()
-        
-        # If no flagged messages, return empty list
-        if not flagged_messages:
-            return []
-
-        # Get the last 5 flagged email IDs
-        latest_flagged_ids = flagged_messages[-count:] if len(flagged_messages) >= count else flagged_messages
-
-        emails = []
-        for email_id in reversed(latest_flagged_ids):  # reversed to get most recent first
-            status, msg = mail.fetch(email_id, '(RFC822)')
-            raw_email = msg[0][1]
-            email_message = email.message_from_bytes(raw_email)
-            
-            # Decode subject
-            subject, encoding = decode_header(email_message['Subject'])[0]
-            subject = subject.decode(encoding or 'utf-8') if isinstance(subject, bytes) else subject
-            
-            # Decode sender
-            from_email, encoding = decode_header(email_message['From'])[0]
-            from_email = from_email.decode(encoding or 'utf-8') if isinstance(from_email, bytes) else from_email
-            
-            # Extract body
-            body = extract_email_body(email_message)
-            
-            emails.append({
-                'from': from_email, 
-                'subject': subject, 
-                'body': body,
-                'is_important': True  # All emails here are important
-            })
-
-        return emails
-    except Exception as e:
-        print(f"Important email retrieval error: {e}")
-        return []
-
-# Helper function to extract email body
-def extract_email_body(email_message):
-    try:
-        body = ""
-        if email_message.is_multipart():
-            for part in email_message.walk():
-                content_type = part.get_content_type()
-                if content_type in ['text/plain', 'text/html']:
-                    try:
-                        body = part.get_payload(decode=True).decode('utf-8')
-                        break
-                    except Exception as e:
-                        print(f"Body decoding error: {e}")
+    context = {}
+    if request.method == 'POST':
+        to_email = request.form.get('to_email', '').strip()
+        subject = request.form.get('subject', '').strip()
+        body = request.form.get('body', '')
+        if not to_email or '@' not in to_email or not subject or not body.strip():
+            context['send_error'] = 'Fill in a valid recipient, a subject and a message.'
         else:
             try:
-                body = email_message.get_payload(decode=True).decode('utf-8')
-            except Exception as e:
-                print(f"Body decoding error: {e}")
-        
-        return body
-    except Exception as e:
-        print(f"Email body extraction error: {e}")
-        return ""
+                send_email(to_email, subject, body)
+                context['success'] = True
+            except EmailError as e:
+                context['send_error'] = str(e)
+
+    emails, inbox_error = fetch_inbox()
+    return render_template('email.html', emails=emails, inbox_error=inbox_error, **context)
 
 def ensure_app_directories():
-    DATA_DIR.mkdir(exist_ok=True)
-    NOTES_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 # PDF text extraction with error handling
 def extract_text_from_pdfs(directory):
+    """Extract each PDF to a sibling .txt file, skipping PDFs whose .txt is already current."""
     try:
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-            print(f"Created directory: {directory}")
-            return
+        import pymupdf  # PyMuPDF >= 1.24.3 (the old `fitz` name is only an alias)
+    except ImportError:
+        print('PyMuPDF is not installed; skipping PDF extraction.')
+        return
 
-        for filename in os.listdir(directory):
-            if filename.endswith('.pdf'):
-                try:
-                    pdf_path = os.path.join(directory, filename)
-                    txt_path = os.path.join(directory, filename.replace('.pdf', '.txt'))
-                    
-                    with fitz.open(pdf_path) as pdf_document:
-                        text = ""
-                        for page_num in range(len(pdf_document)):
-                            page = pdf_document.load_page(page_num)
-                            text += page.get_text()
-                    
-                    with open(txt_path, 'w', encoding='utf-8') as txt_file:
-                        txt_file.write(text)
-                    
-                    print(f"Extracted text from {filename}")
-                except Exception as e:
-                    print(f"Error processing {filename}: {e}")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for pdf_path in sorted(directory.glob('*.pdf')) + sorted(directory.glob('*.PDF')):
+        txt_path = pdf_path.with_suffix('.txt')
+        try:
+            if txt_path.exists() and txt_path.stat().st_mtime >= pdf_path.stat().st_mtime:
+                continue
+            with pymupdf.open(pdf_path) as pdf_document:
+                text = ''.join(page.get_text() for page in pdf_document)
+            txt_path.write_text(text, encoding='utf-8')
+            print(f"Extracted text from {pdf_path.name}")
+        except Exception as e:
+            print(f"Error processing {pdf_path.name}: {e}")
+
+# JSON stores (tasks, notes, tracks)
+def read_json_list(path, label):
+    try:
+        if path.exists():
+            with path.open('r', encoding='utf-8') as file:
+                data = json.load(file)
+            if isinstance(data, list):
+                return data
+            print(f"{label} file is not a list; ignoring it.")
+    except json.JSONDecodeError as e:
+        # Keep the unreadable file so the user's data is not silently overwritten.
+        backup = path.with_suffix(path.suffix + '.corrupt')
+        try:
+            os.replace(path, backup)
+        except OSError:
+            pass
+        print(f"{label} file is corrupt ({e}); moved to {backup.name}")
     except Exception as e:
-        print(f"PDF extraction error: {e}")
+        print(f"{label} loading error: {e}")
+    return []
+
+def write_json_atomic(path, data, label):
+    """Write via a temp file + rename so a crash can never leave a half-written file."""
+    tmp_name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            'w', encoding='utf-8', dir=path.parent, prefix=path.name, suffix='.tmp', delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(data, tmp, indent=2)
+        os.replace(tmp_name, path)
+        return True
+    except Exception as e:
+        print(f"{label} saving error: {e}")
+        if tmp_name and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        return False
 
 # Task management
 def load_tasks():
-    try:
-        if TASKS_FILE.exists():
-            with TASKS_FILE.open('r', encoding='utf-8') as file:
-                return json.load(file)
-        return []
-    except Exception as e:
-        print(f"Task loading error: {e}")
-        return []
+    return read_json_list(TASKS_FILE, 'Task')
 
 def save_tasks(tasks):
-    try:
-        with TASKS_FILE.open('w', encoding='utf-8') as file:
-            json.dump(tasks, file, indent=2)
-    except Exception as e:
-        print(f"Task saving error: {e}")
+    return write_json_atomic(TASKS_FILE, tasks, 'Task')
 
 def load_notes():
-    try:
-        if NOTES_FILE.exists():
-            with NOTES_FILE.open('r', encoding='utf-8') as file:
-                notes = json.load(file)
-                if isinstance(notes, list):
-                    return notes
-        return []
-    except Exception as e:
-        print(f"Note loading error: {e}")
-        return []
+    return read_json_list(NOTES_FILE, 'Note')
 
 def save_notes(notes):
-    try:
-        with NOTES_FILE.open('w', encoding='utf-8') as file:
-            json.dump(notes, file, indent=2)
-    except Exception as e:
-        print(f"Note saving error: {e}")
+    return write_json_atomic(NOTES_FILE, notes, 'Note')
 
 def create_note_record(title, content):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -275,18 +312,34 @@ def create_note_record(title, content):
         'updated_at': timestamp,
     }
 
+def render_note_text(note):
+    return (
+        f"Title: {note['title']}\n"
+        f"Updated at: {note['updated_at']}\n\n"
+        f"{note['content']}\n"
+    )
+
 def sync_note_to_dataset(note):
+    """Write a note's text twin; leaves the file (and its mtime) alone if unchanged."""
     try:
         ensure_app_directories()
         note_path = NOTES_DIR / f"note_{note['id']}.txt"
-        note_text = (
-            f"Title: {note['title']}\n"
-            f"Updated at: {note['updated_at']}\n\n"
-            f"{note['content']}\n"
-        )
+        note_text = render_note_text(note)
+        if note_path.exists() and note_path.read_text(encoding='utf-8') == note_text:
+            return
         note_path.write_text(note_text, encoding='utf-8')
     except Exception as e:
         print(f"Note sync error: {e}")
+
+def append_note(note):
+    """Persist a note to notes.json and its dataset twin; True on success."""
+    with STORE_LOCK:
+        notes_data = load_notes()
+        notes_data.append(note)
+        if not save_notes(notes_data):
+            return False
+        sync_note_to_dataset(note)
+    return True
 
 def remove_note_from_dataset(note_id):
     try:
@@ -310,88 +363,125 @@ def export_notes_markdown(notes):
     return '\n'.join(sections)
 
 def load_focus_tracks():
-    try:
-        if TRACKS_FILE.exists():
-            with TRACKS_FILE.open('r', encoding='utf-8') as file:
-                tracks = json.load(file)
-                if isinstance(tracks, list):
-                    valid_tracks = [
-                        track for track in tracks
-                        if isinstance(track, dict) and track.get('url') and track.get('title')
-                    ]
-                    if valid_tracks:
-                        return valid_tracks
-    except Exception as e:
-        print(f"Track loading error: {e}")
-    return DEFAULT_FOCUS_TRACKS
+    valid_tracks = [
+        track for track in read_json_list(TRACKS_FILE, 'Track')
+        if isinstance(track, dict) and track.get('url') and track.get('title')
+    ]
+    # Copy the defaults so callers can append without mutating the module constant.
+    return valid_tracks or [dict(track) for track in DEFAULT_FOCUS_TRACKS]
 
 def save_focus_tracks(tracks):
-    try:
-        with TRACKS_FILE.open('w', encoding='utf-8') as file:
-            json.dump(tracks, file, indent=2)
-    except Exception as e:
-        print(f"Track saving error: {e}")
+    return write_json_atomic(TRACKS_FILE, tracks, 'Track')
+
+YOUTUBE_HOSTS = ('youtube.com', 'youtu.be', 'youtube-nocookie.com')
+
+def host_matches(host, domain):
+    return host == domain or host.endswith('.' + domain)
 
 def get_youtube_embed_url(raw_url):
     parsed_url = urlparse(raw_url)
-    host = parsed_url.netloc.lower()
+    host = (parsed_url.hostname or '').lower()
     path = parsed_url.path
 
-    if 'youtu.be' in host:
+    if not any(host_matches(host, domain) for domain in YOUTUBE_HOSTS):
+        return ''
+
+    if host_matches(host, 'youtu.be'):
         video_id = path.strip('/').split('/')[0]
-    elif 'youtube.com' in host:
-        if path.startswith('/shorts/'):
-            video_id = path.split('/shorts/')[1].split('/')[0]
-        elif path.startswith('/embed/'):
-            video_id = path.split('/embed/')[1].split('/')[0]
+    else:
+        for prefix in ('/shorts/', '/embed/', '/live/'):
+            if path.startswith(prefix):
+                video_id = path[len(prefix):].split('/')[0]
+                break
         else:
             video_id = parse_qs(parsed_url.query).get('v', [''])[0]
-    else:
-        return ''
 
     if not video_id:
         return ''
 
     return f'https://www.youtube.com/embed/{video_id}'
 
+def get_embed_provider(raw_url):
+    """Return (provider, player_url) for a supported link, or ('', '') if unsupported."""
+    parsed_url = urlparse(raw_url)
+    if parsed_url.scheme not in ('http', 'https'):
+        return '', ''
+
+    host = (parsed_url.hostname or '').lower()
+    youtube_embed = get_youtube_embed_url(raw_url)
+    if youtube_embed:
+        return 'youtube', f'{youtube_embed}?autoplay=1&rel=0'
+
+    if host_matches(host, 'soundcloud.com'):
+        from urllib.parse import quote
+        return 'soundcloud', f'https://w.soundcloud.com/player/?url={quote(raw_url, safe="")}&auto_play=true'
+
+    if host_matches(host, 'spotify.com') and parsed_url.path.strip('/'):
+        return 'spotify', f'https://open.spotify.com/embed/{parsed_url.path.strip("/")}'
+
+    return '', ''
+
 def resolve_track_metadata(track_url):
-    embed_url = get_youtube_embed_url(track_url)
-    if yt_dlp is None:
-        return {
-            'title': 'Custom track',
-            'source_url': track_url,
-            'embed_url': embed_url,
-            'duration': '',
-            'uploader': '',
-            'stream_url': '',
-        }
+    """Build track info. Metadata (title, duration) is best-effort and never blocks playback."""
+    provider, player_url = get_embed_provider(track_url)
+    track = {
+        'title': 'Custom track',
+        'provider': provider,
+        'source_url': track_url,
+        'embed_url': get_youtube_embed_url(track_url) or player_url,
+        'player_url': player_url,
+        'duration': '',
+        'uploader': '',
+        'stream_url': '',
+    }
+    if yt_dlp is None or not provider:
+        return track
 
     ydl_options = {
         'quiet': True,
+        'no_warnings': True,
         'skip_download': True,
         'noplaylist': True,
+        'socket_timeout': 10,
     }
-
-    with yt_dlp.YoutubeDL(ydl_options) as ydl:
-        info = ydl.extract_info(track_url, download=False)
-        if 'entries' in info and info['entries']:
+    try:
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(track_url, download=False)
+        if info and info.get('entries'):
             info = info['entries'][0]
+        if not info:
+            return track
 
         duration = info.get('duration')
-        return {
-            'title': info.get('title') or 'Custom track',
-            'source_url': info.get('webpage_url') or track_url,
-            'embed_url': get_youtube_embed_url(info.get('webpage_url') or track_url),
-            'duration': f'{duration // 60}:{duration % 60:02d}' if isinstance(duration, int) else '',
+        track.update({
+            'title': info.get('title') or track['title'],
+            'duration': f'{int(duration) // 60}:{int(duration) % 60:02d}' if isinstance(duration, (int, float)) else '',
             'uploader': info.get('uploader') or '',
             'stream_url': info.get('url') or '',
-        }
+        })
+    except Exception as e:
+        # Network issue, private video, rate limit...: the embed can still play.
+        print(f"Track metadata lookup failed, falling back to plain embed: {e}")
+    return track
 
 def sync_all_notes_to_dataset():
-    notes_data = load_notes()
+    """Make data/notes mirror notes.json exactly: add/update missing files, drop orphans.
+
+    notes.json is the source of truth, so a reset, a copy to another machine or a
+    hand-deleted file always converges to the same indexed content.
+    """
+    ensure_app_directories()
+    with STORE_LOCK:
+        notes_data = [note for note in load_notes() if isinstance(note, dict) and note.get('id') and note.get('content')]
+    expected = {f"note_{note['id']}.txt" for note in notes_data}
     for note in notes_data:
-        if note.get('id') and note.get('content'):
-            sync_note_to_dataset(note)
+        sync_note_to_dataset(note)
+    for stale_path in NOTES_DIR.glob('note_*.txt'):
+        if stale_path.name not in expected:
+            try:
+                stale_path.unlink()
+            except OSError as e:
+                print(f"Stale note removal error: {e}")
 
 # Home route
 @app.route('/')
@@ -420,9 +510,11 @@ def add_task():
         if not task:
             return jsonify(success=False, error='Task cannot be empty.')
 
-        tasks = load_tasks()
-        tasks.append({'text': task, 'completed': False})
-        save_tasks(tasks)
+        with STORE_LOCK:
+            tasks = load_tasks()
+            tasks.append({'text': task, 'completed': False})
+            if not save_tasks(tasks):
+                return jsonify(success=False, error='Unable to add task right now.')
         return jsonify(success=True, index=len(tasks) - 1)
     except Exception as e:
         print(f"Add task error: {e}")
@@ -432,15 +524,17 @@ def add_task():
 def toggle_task():
     try:
         index = int(request.form['index'])
-        tasks = load_tasks()
-        if index < 0 or index >= len(tasks):
-            return jsonify(success=False, error='Task index out of range.')
+        with STORE_LOCK:
+            tasks = load_tasks()
+            if index < 0 or index >= len(tasks):
+                return jsonify(success=False, error='Task index out of range.')
 
-        tasks[index]['completed'] = not tasks[index]['completed']
-        if tasks[index]['completed']:
-            del tasks[index]
+            tasks[index]['completed'] = not tasks[index]['completed']
+            if tasks[index]['completed']:
+                del tasks[index]
 
-        save_tasks(tasks)
+            if not save_tasks(tasks):
+                return jsonify(success=False, error='Unable to update task.')
         return jsonify(success=True)
     except Exception as e:
         print(f"Toggle task error: {e}")
@@ -463,10 +557,8 @@ def add_note():
             return jsonify(success=False, error='Note content cannot be empty.')
 
         note = create_note_record(title, content)
-        notes_data = load_notes()
-        notes_data.append(note)
-        save_notes(notes_data)
-        sync_note_to_dataset(note)
+        if not append_note(note):
+            return jsonify(success=False, error='Unable to save note.')
         return jsonify(success=True, note=note)
     except Exception as e:
         print(f"Note add error: {e}")
@@ -480,13 +572,15 @@ def delete_note():
         if not note_id:
             return jsonify(success=False, error='Invalid note id.')
 
-        notes_data = load_notes()
-        remaining_notes = [note for note in notes_data if note.get('id') != note_id]
-        if len(remaining_notes) == len(notes_data):
-            return jsonify(success=False, error='Note not found.')
+        with STORE_LOCK:
+            notes_data = load_notes()
+            remaining_notes = [note for note in notes_data if note.get('id') != note_id]
+            if len(remaining_notes) == len(notes_data):
+                return jsonify(success=False, error='Note not found.')
 
-        save_notes(remaining_notes)
-        remove_note_from_dataset(note_id)
+            if not save_notes(remaining_notes):
+                return jsonify(success=False, error='Unable to delete note.')
+            remove_note_from_dataset(note_id)
         return jsonify(success=True)
     except Exception as e:
         print(f"Note delete error: {e}")
@@ -505,10 +599,8 @@ def import_note():
 
         inferred_title = Path(uploaded_file.filename).stem.replace('_', ' ').strip()
         note = create_note_record(inferred_title, raw_content)
-        notes_data = load_notes()
-        notes_data.append(note)
-        save_notes(notes_data)
-        sync_note_to_dataset(note)
+        if not append_note(note):
+            return jsonify(success=False, error='Unable to import note.')
         return jsonify(success=True, note=note)
     except Exception as e:
         print(f"Note import error: {e}")
@@ -524,6 +616,10 @@ def export_notes():
         headers={'Content-Disposition': 'attachment; filename=zehnnflow-notes.md'},
     )
 
+UNSUPPORTED_TRACK_MESSAGE = (
+    'That link is not supported. Paste a full https:// YouTube, SoundCloud or Spotify link.'
+)
+
 @app.route('/focus')
 def focus():
     return render_template('focus.html', tracks=load_focus_tracks(), yt_dlp_ready=yt_dlp is not None)
@@ -537,15 +633,19 @@ def add_focus_track():
 
         if not title or not url:
             return jsonify(success=False, error='Track title and URL are required.')
+        if not get_embed_provider(url)[0]:
+            return jsonify(success=False, error=UNSUPPORTED_TRACK_MESSAGE)
 
-        tracks = load_focus_tracks()
-        track_exists = any(track.get('url') == url for track in tracks)
-        if track_exists:
-            return jsonify(success=False, error='That track is already in your quick list.')
+        with STORE_LOCK:
+            tracks = load_focus_tracks()
+            track_exists = any(track.get('url') == url for track in tracks)
+            if track_exists:
+                return jsonify(success=False, error='That track is already in your quick list.')
 
-        track = {'title': title, 'url': url}
-        tracks.append(track)
-        save_focus_tracks(tracks)
+            track = {'title': title, 'url': url}
+            tracks.append(track)
+            if not save_focus_tracks(tracks):
+                return jsonify(success=False, error='Unable to save track.')
         return jsonify(success=True, track=track)
     except Exception as e:
         print(f"Track add error: {e}")
@@ -559,96 +659,130 @@ def resolve_focus_track():
         if not track_url:
             return jsonify(success=False, error='Track URL is required.')
 
-        track = resolve_track_metadata(track_url)
-        if not track.get('embed_url'):
-            return jsonify(
-                success=False,
-                error='Use a YouTube URL for now so the built-in player can load it.',
-            )
-        return jsonify(success=True, track=track)
+        if not get_embed_provider(track_url)[0]:
+            return jsonify(success=False, error=UNSUPPORTED_TRACK_MESSAGE)
+
+        return jsonify(success=True, track=resolve_track_metadata(track_url))
     except Exception as e:
         print(f"Track resolve error: {e}")
         return jsonify(success=False, error='Could not load track metadata.')
 
-# Chat route with robust error handling
-@app.route('/chat', methods=['GET', 'POST'])
-def chat():
-    try:
-        if request.method == 'POST':
-            messages = []
-            user_message = request.form.get('text_input', '').strip()
-            if not user_message:
-                return render_template(
-                    'chat.html',
-                    messages=[{'type': 'ai', 'content': 'Type a message to start the conversation.'}],
-                    username=getuser(),
+class ChatUnavailable(Exception):
+    """The chat cannot answer yet; the message is safe to show to the user."""
+
+class ChatEngine:
+    """Owns the LLM, embedding model and vector index for the whole process.
+
+    * Models are created once, on first use, and passed explicitly to llama_index
+      instead of mutating the global ``Settings`` singleton, so concurrent
+      requests cannot race on shared state.
+    * The index is cached and only rebuilt when the indexed files change.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._llm = None
+        self._embed_model = None
+        self._index = None
+        self._fingerprint = None
+
+    def _get_models(self):
+        if self._llm is None or self._embed_model is None:
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+            from llama_index.llms.ollama import Ollama
+
+            self._embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
+            self._llm = Ollama(model=LLM_MODEL, request_timeout=360.0)
+        return self._llm, self._embed_model
+
+    @staticmethod
+    def dataset_fingerprint():
+        """A cheap signature (path, size, mtime) of every indexable file."""
+        if not DATA_DIR.exists():
+            return ()
+        return tuple(sorted(
+            (path.relative_to(DATA_DIR).as_posix(), path.stat().st_size, path.stat().st_mtime_ns)
+            for path in DATA_DIR.rglob('*')
+            if path.is_file() and path.suffix.lower() in INDEXED_EXTENSIONS
+        ))
+
+    def prepare_dataset(self):
+        """Bring derived files (PDF text, note text) up to date before indexing."""
+        ensure_app_directories()
+        extract_text_from_pdfs(DATA_DIR)
+        sync_all_notes_to_dataset()
+
+    def get_index(self):
+        with self._lock:
+            self.prepare_dataset()
+            fingerprint = self.dataset_fingerprint()
+            if not fingerprint:
+                self._index, self._fingerprint = None, None
+                raise ChatUnavailable(
+                    'No data found. Add .txt, .md or .pdf files to `data/` or create notes from the Notes tab.'
                 )
+            if self._index is not None and fingerprint == self._fingerprint:
+                return self._index
 
-            messages.append({'type': 'user', 'content': user_message})
-            username = getuser()
-
-            ensure_app_directories()
-
-            # Check if documents exist
-            if not DATA_DIR.exists() or not any(DATA_DIR.iterdir()):
-                return render_template(
-                    'chat.html',
-                    messages=[
-                        {
-                            'type': 'ai',
-                            'content': 'No data found. Add files to `data/` or create notes from the Notes tab.',
-                        }
-                    ],
-                    username=username,
-                )
+            from llama_index.core import VectorStoreIndex
+            from llama_index.core.readers import SimpleDirectoryReader
 
             try:
-                documents = SimpleDirectoryReader(str(DATA_DIR)).load_data()
+                documents = SimpleDirectoryReader(
+                    str(DATA_DIR), recursive=True, required_exts=list(INDEXED_EXTENSIONS)
+                ).load_data()
             except Exception as e:
                 print(f"Document loading error: {e}")
-                return render_template(
-                    'chat.html',
-                    messages=[{'type': 'ai', 'content': f'Error loading documents: {e}'}],
-                    username=username,
-                )
-
-            # Fallback if no documents
+                raise ChatUnavailable('Could not read the files in `data/`. Check the server log for details.')
             if not documents:
-                return render_template(
-                    'chat.html',
-                    messages=[{'type': 'ai', 'content': 'No readable documents found.'}],
-                    username=username,
-                )
+                raise ChatUnavailable('No readable documents found.')
 
-            # Configure settings
-            Settings.embed_model = HuggingFaceEmbedding(model_name='BAAI/bge-base-en-v1.5')
-            Settings.llm = Ollama(model='llama3', request_timeout=360.0)
+            _, embed_model = self._get_models()
+            self._index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
+            self._fingerprint = fingerprint
+            return self._index
 
-            # Create index and query
-            index = VectorStoreIndex.from_documents(documents)
-            query_engine = index.as_query_engine()
+    def ask(self, user_message):
+        index = self.get_index()
+        llm, _ = self._get_models()
+        query_engine = index.as_query_engine(llm=llm)
+        response = query_engine.query(
+            f"""Process the following user input using the context documents:
+            User query: {user_message}
+            Provide a clear, concise response in markdown format."""
+        )
+        return str(response)
 
-            response = query_engine.query(
-                f"""Process the following user input using the context documents:
-                User query: {user_message}
-                Provide a clear, concise response in markdown format."""
-            )
+chat_engine = ChatEngine()
 
-            ai_response = markdown(str(response))
-            messages.append({'type': 'ai', 'content': ai_response})
-            return render_template('chat.html', messages=messages, username=username)
-
-        username = getuser()
+# Chat route
+@app.route('/chat', methods=['GET', 'POST'])
+def chat():
+    username = getuser()
+    if request.method != 'POST':
         return render_template('chat.html', messages=[], username=username)
 
-    except Exception as e:
-        # Log the error and provide a user-friendly message
-        print(f"Chat error: {e}")
+    user_message = request.form.get('text_input', '').strip()
+    if not user_message:
         return render_template(
             'chat.html',
-            messages=[{'type': 'ai', 'content': f'An error occurred: {str(e)}'}],
-            username=getuser(),
+            messages=[{'type': 'ai', 'content': 'Type a message to start the conversation.'}],
+            username=username,
         )
+
+    messages = [{'type': 'user', 'content': user_message}]
+    try:
+        messages.append({'type': 'ai', 'content': markdown(chat_engine.ask(user_message))})
+    except ChatUnavailable as e:
+        messages.append({'type': 'ai', 'content': str(escape(e))})
+    except Exception as e:
+        print(f"Chat error: {e}")
+        messages.append({
+            'type': 'ai',
+            'content': 'The assistant could not answer. Make sure Ollama is running with the '
+                       f'`{escape(LLM_MODEL)}` model pulled, then try again.',
+        })
+    return render_template('chat.html', messages=messages, username=username)
 
 # Utility functions
 def get_greeting():
@@ -670,13 +804,41 @@ def get_quote():
         print(f"Quote retrieval error: {e}")
         return 'Unable to fetch quote'
 
-# Main execution
-if __name__ == '__main__':
-    # Ensure data and notes directories exist and refresh searchable data.
-    ensure_app_directories()
-    extract_text_from_pdfs(str(DATA_DIR))
-    sync_all_notes_to_dataset()
+def run_desktop():
+    """Open the app in a native pywebview window (the default experience)."""
+    try:
+        import webview
+    except ImportError:
+        print('pywebview is not installed; falling back to web mode. Install it for the desktop window.')
+        return run_web()
 
-    # Create webview window
     webview.create_window('ZehnnFlow', app, width=1100, height=820)
     webview.start()
+
+def run_web(host='127.0.0.1', port=5000):
+    """Serve the app over HTTP with waitress (falls back to Flask's dev server)."""
+    print(f'ZehnnFlow running at http://{host}:{port}')
+    try:
+        from waitress import serve
+    except ImportError:
+        app.run(host=host, port=port)
+    else:
+        serve(app, host=host, port=port)
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='ZehnnFlow productivity suite')
+    parser.add_argument('--web', action='store_true', help='serve over HTTP instead of opening a desktop window')
+    parser.add_argument('--host', default='127.0.0.1', help='web mode: interface to bind (default 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=5000, help='web mode: port to listen on (default 5000)')
+    args = parser.parse_args(argv)
+
+    # Startup stays light: only create folders. PDF extraction, note syncing and
+    # indexing happen lazily on the first chat request.
+    ensure_app_directories()
+    if args.web:
+        run_web(args.host, args.port)
+    else:
+        run_desktop()
+
+if __name__ == '__main__':
+    main()

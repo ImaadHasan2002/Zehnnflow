@@ -76,7 +76,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const loadTrack = async (url, titleHint = '') => {
         if (!url) {
-            setTrackStatus('Please paste a valid YouTube URL.', 'error');
+            setTrackStatus('Please paste a YouTube, SoundCloud or Spotify link.', 'error');
             return;
         }
 
@@ -97,7 +97,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const track = data.track;
             playerElement.classList.remove('hidden');
-            playerElement.src = `${track.embed_url}?autoplay=1&rel=0`;
+            playerElement.src = track.player_url || track.embed_url;
             trackTitleElement.textContent = track.title || titleHint || 'Focus track';
 
             const metaParts = [];

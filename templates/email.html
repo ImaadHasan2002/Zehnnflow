@@ -25,6 +25,10 @@
                 <p>Latest flagged emails so you can triage priority messages quickly.</p>
             </div>
 
+            {% if inbox_error %}
+                <p class='status-message error'>{{ inbox_error }}</p>
+            {% endif %}
+
             {% if emails %}
                 <div class='email-list'>
                     {% for email in emails %}
@@ -35,7 +39,7 @@
                         </article>
                     {% endfor %}
                 </div>
-            {% else %}
+            {% elif not inbox_error %}
                 <p class='empty-state'>No flagged emails found right now.</p>
             {% endif %}
         </section>
@@ -49,8 +53,8 @@
             {% if success %}
                 <p class='status-message success'>Email sent successfully.</p>
             {% endif %}
-            {% if error %}
-                <p class='status-message error'>Unable to send email. Check credentials and retry.</p>
+            {% if send_error %}
+                <p class='status-message error'>{{ send_error }}</p>
             {% endif %}
 
             <form class='form-stack' method='POST' action='{{ url_for("email_route") }}'>
