@@ -6,12 +6,13 @@ A versatile productivity suite designed to support individuals in achieving a fo
 **ZehnnFlow** is a minimalist desktop application built with [pywebview](). It provides tools to minimize distractions and optimize productivity in a clutter-free environment.  
 
 ## Key Features  
-- **Task Management**: Organize your day with a simple to-do list; double-click a task to edit it.  
+- **Task Management**: Organize your day with a to-do list: reorder with the arrow buttons, double-click to edit, completed tasks are archived (restore or clear them anytime).  
 - **AI-Powered Assistance**: Engage with an intelligent chatbot utilizing Retrieval-Augmented Generation (RAG) on custom datasets, powered by Llama3 and llama_index ([ollama]()).  
 - **Streamlined Email Client**: Check flagged emails (cached for 60s, with a Refresh link), draft messages, and send emails in a clean interface.  
 - **Integrated Notes**: Save, edit and search notes; they are automatically re-indexed into the chatbot dataset.  
 - **Focus Music + Timer**: Run focus sessions with YouTube, SoundCloud or Spotify ambient tracks and a built-in timer.  
-- **Read-Aloud Chat**: Use accessibility controls to read AI responses aloud.  
+- **Read-Aloud Chat**: Use accessibility controls to read AI responses aloud. Your chat history is saved between sessions.  
+- **Backup**: Export tasks, notes, focus tracks and chat history to one JSON file and merge it back in on any install.  
 
 ## Roadmap  
 Planned improvements for future versions include:  
@@ -54,7 +55,8 @@ Follow these steps to set up **ZehnnFlow**:
 
 5. Start the application:  
    ```bash
-   python zehnnflow.py                 # desktop window (pywebview)
+   python zehnnflow.py                 # desktop window (pywebview); falls back to web mode if no GUI toolkit is found
+                                       # (on Linux: pip install "pywebview[qt]" or install GTK)
    python zehnnflow.py --web           # plain web server on http://127.0.0.1:5000
    python zehnnflow.py --web --host 0.0.0.0 --port 8080
    ```  

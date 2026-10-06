@@ -541,3 +541,23 @@ button:hover,
     display: grid;
     gap: 0.5rem;
 }
+
+.task-actions {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.completed-section {
+    margin-top: 1rem;
+}
+
+.completed-section summary {
+    cursor: pointer;
+    margin-bottom: 0.6rem;
+}
+
+.task-item.completed .task-text {
+    text-decoration: line-through;
+    opacity: 0.7;
+}
