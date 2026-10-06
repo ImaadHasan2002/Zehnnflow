@@ -69,6 +69,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const item = document.createElement('li');
         item.className = completed ? 'task-item completed' : 'task-item';
         item.dataset.id = task.id;
+        item.draggable = !completed;
 
         const textElement = document.createElement('span');
         textElement.className = 'task-text';
@@ -176,6 +177,7 @@ document.addEventListener('DOMContentLoaded', () => {
         input.value = originalText;
         input.setAttribute('aria-label', 'Edit task');
         target.classList.add('hidden');
+        taskItem.draggable = false;   // lets the input select text instead of starting a drag
         target.after(input);
         input.focus();
         input.select();
@@ -189,6 +191,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const newText = input.value.trim();
             input.remove();
             target.classList.remove('hidden');
+            taskItem.draggable = true;
             if (!save || !newText || newText === originalText) {
                 return;
             }
@@ -229,6 +232,68 @@ document.addEventListener('DOMContentLoaded', () => {
             return response.json();
         }, 'Unable to reorder tasks.');
     };
+
+    // --- Drag and drop (arrow buttons remain the keyboard / touch alternative) ---
+    const openTaskIds = () => Array.from(todoListElement.querySelectorAll('.task-item')).map((item) => item.dataset.id);
+    let draggedItem = null;
+    let orderBeforeDrag = [];
+
+    todoListElement.addEventListener('dragstart', (event) => {
+        const item = event.target instanceof HTMLElement ? event.target.closest('.task-item') : null;
+        if (!item || !item.draggable) {
+            return;
+        }
+        draggedItem = item;
+        orderBeforeDrag = openTaskIds();
+        item.classList.add('dragging');
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', item.dataset.id || '');   // Firefox needs data to start a drag
+    });
+
+    todoListElement.addEventListener('dragover', (event) => {
+        if (!draggedItem) {
+            return;
+        }
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        const overItem = event.target instanceof HTMLElement ? event.target.closest('.task-item') : null;
+        if (!overItem || overItem === draggedItem) {
+            return;
+        }
+        const box = overItem.getBoundingClientRect();
+        const placeAfter = event.clientY > box.top + box.height / 2;
+        const sibling = placeAfter ? overItem.nextElementSibling : overItem;
+        if (sibling !== draggedItem) {
+            todoListElement.insertBefore(draggedItem, sibling);
+        }
+    });
+
+    todoListElement.addEventListener('drop', (event) => {
+        if (draggedItem) {
+            event.preventDefault();
+        }
+    });
+
+    todoListElement.addEventListener('dragend', async () => {
+        if (!draggedItem) {
+            return;
+        }
+        draggedItem.classList.remove('dragging');
+        draggedItem = null;
+        const ids = openTaskIds();
+        if (ids.join() === orderBeforeDrag.join()) {
+            return;
+        }
+        // mutate() re-renders from the server afterwards, so a rejected order snaps back.
+        await mutate(async () => {
+            const response = await fetch('/reorder_tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids }),
+            });
+            return response.json();
+        }, 'Unable to reorder tasks.');
+    });
 
     const handleTaskClick = async (event) => {
         const target = event.target;
@@ -280,7 +345,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const added = data.added;
                 showMessage(
                     dataStatusElement,
-                    `Imported ${added.tasks} tasks, ${added.notes} notes, ${added.tracks} tracks, ${added.chat_history} chat messages.`,
+                    `Imported ${added.tasks} tasks, ${added.notes} notes, ${added.tracks} tracks, ${added.chat_messages} chat messages.`,
                     'success',
                 );
                 importFormElement.reset();

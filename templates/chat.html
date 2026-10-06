@@ -22,7 +22,7 @@
         <section class='panel-card chat-panel'>
             <div class='panel-header'>
                 <h1>Chat with Llama 3</h1>
-                <p>Ask questions grounded in your `data/` files and synced notes. Your conversation is saved.</p>
+                <p>Ask questions grounded in your `data/` files and synced notes. Conversations are saved and follow-up questions keep their context.</p>
             </div>
 
             <div id='chat-messages' class='chat-messages'>
@@ -53,6 +53,7 @@
             </div>
 
             <form id='chat-form' class='input-row chat-input-row' action='{{ url_for("chat") }}' method='POST'>
+                <input type='hidden' name='thread' value='{{ current.id if current else "" }}'>
                 <input
                     type='text'
                     id='text-input'
@@ -63,12 +64,46 @@
                 >
                 <button id='send-btn' type='submit'>Send</button>
             </form>
-            {% if messages %}
-            <form action='{{ url_for("clear_chat") }}' method='POST' onsubmit="return confirm('Clear the whole chat history?');">
-                <button type='submit' class='secondary-btn'>Clear history</button>
+            {% if current and messages %}
+            <form action='{{ url_for("clear_chat") }}' method='POST' onsubmit="return confirm('Clear all messages in this conversation?');">
+                <input type='hidden' name='thread' value='{{ current.id }}'>
+                <button type='submit' class='secondary-btn'>Clear conversation</button>
             </form>
             {% endif %}
         </section>
+
+        <aside class='panel-card threads-panel'>
+            <div class='panel-header'>
+                <h2>Conversations</h2>
+                <p>Each thread keeps its own context.</p>
+            </div>
+            <form action='{{ url_for("new_chat") }}' method='POST'>
+                <button type='submit' id='new-chat-btn' class='secondary-btn'>+ New chat</button>
+            </form>
+            <ul class='thread-list'>
+                {% for thread in threads %}
+                    <li class='thread-item{% if current and thread.id == current.id %} active{% endif %}'>
+                        <a href='{{ url_for("chat", thread=thread.id) }}' class='thread-link'>
+                            <span class='thread-title'>{{ thread.title }}</span>
+                            <span class='thread-meta'>{{ thread.messages|length }} messages · {{ thread.updated_at }}</span>
+                        </a>
+                        <form action='{{ url_for("delete_chat") }}' method='POST' onsubmit="return confirm('Delete this conversation?');">
+                            <input type='hidden' name='thread' value='{{ thread.id }}'>
+                            <button type='submit' class='danger-btn delete-thread-btn' aria-label='Delete conversation'>✕</button>
+                        </form>
+                    </li>
+                {% else %}
+                    <li class='empty-state'>No conversations yet. Send a message to start one.</li>
+                {% endfor %}
+            </ul>
+            {% if current %}
+            <form action='{{ url_for("rename_chat") }}' method='POST' class='rename-form'>
+                <input type='hidden' name='thread' value='{{ current.id }}'>
+                <input type='text' name='title' value='{{ current.title }}' maxlength='80' aria-label='Conversation title'>
+                <button type='submit' class='secondary-btn'>Rename</button>
+            </form>
+            {% endif %}
+        </aside>
 
         <aside class='panel-card tts-panel'>
             <div class='panel-header'>

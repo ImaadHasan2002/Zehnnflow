@@ -46,7 +46,9 @@ TASKS_FILE = HOME_DIR / 'tasks.json'
 NOTES_FILE = HOME_DIR / 'notes.json'
 TRACKS_FILE = HOME_DIR / 'tracks.json'
 CHAT_FILE = HOME_DIR / 'chat_history.json'
-MAX_CHAT_MESSAGES = 200
+MAX_CHAT_MESSAGES = 200   # kept per thread
+CHAT_CONTEXT_MESSAGES = 10  # earlier messages given to the model as context
+DEFAULT_THREAD_TITLE = 'New chat'
 
 # Guards read-modify-write cycles on the JSON stores (waitress is multi-threaded).
 STORE_LOCK = threading.RLock()
@@ -80,17 +82,59 @@ def get_email_credentials():
 class EmailError(Exception):
     """An email problem with a message that is safe to show to the user."""
 
+class EmailNotConfigured(EmailError):
+    """Credentials are missing; nothing was attempted, so there is nothing to back off from."""
+
+class TransientEmailError(EmailError):
+    """A network-level failure that is worth retrying (timeouts, dropped connections)."""
+
 MISSING_CREDENTIALS_MESSAGE = (
     'Email is not set up yet. Add EMAIL_ADDRESS and GOOGLE_APP_PASSWORD '
     '(a Gmail app password) to your .env file, then restart ZehnnFlow.'
 )
+GMAIL_UNREACHABLE_MESSAGE = 'Could not reach Gmail. Check your connection and retry.'
+
+# Retry policy for transient failures: 3 attempts, waiting 1s then 2s in between.
+EMAIL_ATTEMPTS = 3
+EMAIL_BASE_DELAY = 1.0
+_sleep = time.sleep  # indirection so tests don't really wait
+
+def call_with_retries(func, attempts=None, base_delay=None):
+    """Call ``func``, retrying only TransientEmailError with exponential backoff.
+
+    Anything else (bad password, refused recipient...) is raised immediately,
+    because repeating it cannot help and repeated bad logins can lock the account.
+    """
+    attempts = attempts or EMAIL_ATTEMPTS
+    base_delay = EMAIL_BASE_DELAY if base_delay is None else base_delay
+    for attempt in range(attempts):
+        try:
+            return func()
+        except TransientEmailError as e:
+            if attempt == attempts - 1:
+                raise
+            print(f"Email attempt {attempt + 1}/{attempts} failed ({e}); retrying")
+            _sleep(base_delay * 2 ** attempt)
+
+def is_transient_smtp_error(error):
+    """smtplib.SMTPException subclasses OSError, so classify explicitly instead of catching OSError."""
+    if isinstance(error, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError)):
+        return True
+    if isinstance(error, smtplib.SMTPResponseException):
+        return 400 <= error.smtp_code < 500   # 4xx = "try again later"
+    return isinstance(error, OSError) and not isinstance(error, smtplib.SMTPException)
 
 # Function to send an email
 def send_email(to_email, subject, body):
-    """Send a message through Gmail SMTP. Raises EmailError with a friendly message."""
+    """Send a message through Gmail SMTP. Raises EmailError with a friendly message.
+
+    Connecting and logging in are retried on transient errors. The send itself is
+    never retried: if the connection drops mid-send we cannot know whether Gmail
+    accepted the message, and retrying could deliver it twice.
+    """
     from_email, password = get_email_credentials()
     if not from_email or not password:
-        raise EmailError(MISSING_CREDENTIALS_MESSAGE)
+        raise EmailNotConfigured(MISSING_CREDENTIALS_MESSAGE)
 
     msg = MIMEMultipart()
     msg['From'] = from_email
@@ -98,35 +142,67 @@ def send_email(to_email, subject, body):
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
 
-    try:
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as server:
+    def connect():
+        server = None
+        try:
+            server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
             server.starttls()
             server.login(from_email, password)
-            server.sendmail(from_email, to_email, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        raise EmailError('Gmail rejected the login. Check that you are using an app password, not your normal password.')
+            return server
+        except smtplib.SMTPAuthenticationError:
+            raise EmailError('Gmail rejected the login. Check that you are using an app password, not your normal password.')
+        except (smtplib.SMTPException, OSError) as e:
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+            if is_transient_smtp_error(e):
+                print(f"Email connect error: {e}")
+                raise TransientEmailError(GMAIL_UNREACHABLE_MESSAGE)
+            raise EmailError('Gmail refused the connection. Check your account settings and retry.')
+
+    server = call_with_retries(connect)
+    try:
+        server.sendmail(from_email, to_email, msg.as_string())
     except smtplib.SMTPRecipientsRefused:
         raise EmailError('The recipient address was refused. Check the "To" address.')
     except (smtplib.SMTPException, OSError) as e:
         print(f"Email sending error: {e}")
-        raise EmailError('Could not reach Gmail to send the message. Check your connection and retry.')
+        raise EmailError('Gmail did not confirm the message was sent. Check your Sent folder before trying again.')
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
 
 # Function to login to email
 def login_to_email():
-    """Open an IMAP session. Raises EmailError with a friendly message."""
+    """Open an IMAP session. Raises EmailError (TransientEmailError if worth retrying)."""
     email_address, app_password = get_email_credentials()
     if not email_address or not app_password:
-        raise EmailError(MISSING_CREDENTIALS_MESSAGE)
+        raise EmailNotConfigured(MISSING_CREDENTIALS_MESSAGE)
 
     try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993, timeout=15)
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993, timeout=10)
+    except OSError as e:
+        print(f"Email connect error: {e}")
+        raise TransientEmailError(GMAIL_UNREACHABLE_MESSAGE)
+    except imaplib.IMAP4.error as e:
+        print(f"Email connect error: {e}")
+        raise EmailError('Gmail refused the connection. Check that IMAP is enabled for the account.')
+
+    try:
         mail.login(email_address, app_password)
         return mail
+    except imaplib.IMAP4.abort as e:
+        print(f"Email login dropped: {e}")
+        raise TransientEmailError(GMAIL_UNREACHABLE_MESSAGE)
     except imaplib.IMAP4.error:
         raise EmailError('Gmail rejected the login. Check that IMAP is enabled and that you are using an app password.')
     except OSError as e:
         print(f"Email login error: {e}")
-        raise EmailError('Could not reach Gmail. Check your connection and retry.')
+        raise TransientEmailError(GMAIL_UNREACHABLE_MESSAGE)
 
 def decode_mime_header(value):
     """Decode an RFC 2047 header (all encoded words) to text; tolerate missing headers."""
@@ -161,40 +237,61 @@ def get_latest_emails(mail, count=5):
         return emails
     except EmailError:
         raise
-    except (imaplib.IMAP4.error, OSError) as e:
+    except (imaplib.IMAP4.abort, OSError) as e:
+        print(f"Important email retrieval error: {e}")
+        raise TransientEmailError('Lost the connection to Gmail while reading your inbox.')
+    except imaplib.IMAP4.error as e:
         print(f"Important email retrieval error: {e}")
         raise EmailError('Could not read your inbox right now. Retry in a moment.')
 
 INBOX_CACHE_SECONDS = 60
-_inbox_cache = {'at': 0.0, 'emails': None}
+# After a failed fetch, further automatic visits fail fast for a while instead of
+# hanging on a dead connection or hammering Gmail: 15s, 30s, 60s ... up to 5 minutes.
+INBOX_COOLDOWN_BASE = 15
+INBOX_COOLDOWN_MAX = 300
+_inbox_cache = {'at': 0.0, 'emails': None, 'failures': 0, 'retry_after': 0.0, 'error': None}
 _inbox_lock = threading.Lock()
 
-def fetch_inbox(force=False):
-    """Return (emails, error_message), cached for INBOX_CACHE_SECONDS.
+def fetch_inbox_once():
+    """One full attempt: log in, read flagged mail, log out."""
+    mail = login_to_email()
+    try:
+        return get_latest_emails(mail)
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
-    Only successful fetches are cached, so an error is retried on the next visit.
-    ``force=True`` (the Refresh button) bypasses the cache.
+def fetch_inbox(force=False):
+    """Return (emails, error_message).
+
+    * Successful results are cached for INBOX_CACHE_SECONDS.
+    * Transient failures are retried with backoff inside one call (see call_with_retries).
+    * After a failure, automatic visits get the last error immediately until a growing
+      cooldown passes; ``force=True`` (the Refresh link) bypasses both cache and cooldown.
     """
     with _inbox_lock:
-        fresh = time.monotonic() - _inbox_cache['at'] < INBOX_CACHE_SECONDS
-        if not force and fresh and _inbox_cache['emails'] is not None:
-            return _inbox_cache['emails'], None
+        now = time.monotonic()
+        if not force:
+            if _inbox_cache['emails'] is not None and now - _inbox_cache['at'] < INBOX_CACHE_SECONDS:
+                return _inbox_cache['emails'], None
+            if _inbox_cache['error'] and now < _inbox_cache['retry_after']:
+                return [], _inbox_cache['error']
 
         try:
-            mail = login_to_email()
-        except EmailError as e:
+            emails = call_with_retries(fetch_inbox_once)
+        except EmailNotConfigured as e:
             return [], str(e)
-        try:
-            emails = get_latest_emails(mail)
         except EmailError as e:
+            failures = _inbox_cache['failures'] + 1
+            cooldown = min(INBOX_COOLDOWN_BASE * 2 ** (failures - 1), INBOX_COOLDOWN_MAX)
+            _inbox_cache.update(
+                failures=failures, error=str(e), retry_after=time.monotonic() + cooldown, emails=None,
+            )
             return [], str(e)
-        finally:
-            try:
-                mail.logout()
-            except Exception:
-                pass
 
-        _inbox_cache.update(at=time.monotonic(), emails=emails)
+        _inbox_cache.update(at=time.monotonic(), emails=emails, failures=0, retry_after=0.0, error=None)
         return emails, None
 
 # Helper function to extract email body
@@ -270,14 +367,15 @@ def extract_text_from_pdfs(directory):
             print(f"Error processing {pdf_path.name}: {e}")
 
 # JSON stores (tasks, notes, tracks)
-def read_json_list(path, label):
+def read_json(path, label, expected_types=(list,)):
+    """Read a JSON file, returning None when missing/unusable. Corrupt files are kept as *.corrupt."""
     try:
         if path.exists():
             with path.open('r', encoding='utf-8') as file:
                 data = json.load(file)
-            if isinstance(data, list):
+            if isinstance(data, expected_types):
                 return data
-            print(f"{label} file is not a list; ignoring it.")
+            print(f"{label} file has an unexpected shape; ignoring it.")
     except json.JSONDecodeError as e:
         # Keep the unreadable file so the user's data is not silently overwritten.
         backup = path.with_suffix(path.suffix + '.corrupt')
@@ -288,7 +386,11 @@ def read_json_list(path, label):
         print(f"{label} file is corrupt ({e}); moved to {backup.name}")
     except Exception as e:
         print(f"{label} loading error: {e}")
-    return []
+    return None
+
+def read_json_list(path, label):
+    data = read_json(path, label, (list,))
+    return data if data is not None else []
 
 def write_json_atomic(path, data, label):
     """Write via a temp file + rename so a crash can never leave a half-written file."""
@@ -881,71 +983,190 @@ class ChatEngine:
             self._fingerprint = fingerprint
             return self._index
 
-    def ask(self, user_message):
+    def ask(self, user_message, history=()):
+        """Answer ``user_message`` from the indexed files. ``history`` is the earlier
+        {'type': 'user'|'ai', 'content': ...} messages of the same thread, so follow-ups
+        like "and the second one?" are understood."""
         index = self.get_index()
         llm, _ = self._get_models()
-        query_engine = index.as_query_engine(llm=llm)
-        response = query_engine.query(
-            f"""Process the following user input using the context documents:
-            User query: {user_message}
-            Provide a clear, concise response in markdown format."""
+
+        from llama_index.core.llms import ChatMessage, MessageRole
+
+        chat_history = [
+            ChatMessage(role=MessageRole.USER if m['type'] == 'user' else MessageRole.ASSISTANT, content=m['content'])
+            for m in list(history)[-CHAT_CONTEXT_MESSAGES:]
+        ]
+        engine = index.as_chat_engine(
+            chat_mode='condense_plus_context',
+            llm=llm,
+            system_prompt='Answer using the context documents. Give a clear, concise response in markdown format.',
         )
-        return str(response)
+        return str(engine.chat(user_message, chat_history=chat_history))
 
 chat_engine = ChatEngine()
 
-# Chat history (persisted so a restart or page reload keeps the conversation)
-def load_chat_history():
-    return [
-        message for message in read_json_list(CHAT_FILE, 'Chat history')
-        if isinstance(message, dict) and message.get('type') in ('user', 'ai') and isinstance(message.get('content'), str)
-    ]
+# Chat threads (persisted so a restart or page reload keeps every conversation)
+def now_stamp():
+    return datetime.now().strftime('%Y-%m-%d %H:%M')
 
-def append_chat_messages(new_messages):
+def clean_message(item):
+    if not isinstance(item, dict) or item.get('type') not in ('user', 'ai') or not isinstance(item.get('content'), str):
+        return None
+    if not item['content'].strip():
+        return None
+    return {'type': item['type'], 'content': item['content'][:100_000], 'at': str(item.get('at') or '')[:32]}
+
+def clean_thread(item):
+    if not isinstance(item, dict) or not item.get('id'):
+        return None
+    messages = [m for m in map(clean_message, item.get('messages') or []) if m]
+    stamp = str(item.get('updated_at') or item.get('created_at') or '')[:32]
+    return {
+        'id': str(item['id'])[:64],
+        'title': str(item.get('title') or '').strip()[:80] or DEFAULT_THREAD_TITLE,
+        'created_at': str(item.get('created_at') or stamp)[:32],
+        'updated_at': stamp,
+        'messages': messages[-MAX_CHAT_MESSAGES:],
+    }
+
+def make_thread(title=DEFAULT_THREAD_TITLE, messages=None):
+    stamp = now_stamp()
+    return {'id': uuid.uuid4().hex, 'title': title, 'created_at': stamp, 'updated_at': stamp, 'messages': messages or []}
+
+def load_threads():
+    """All threads, most recently updated first. Understands the old flat-list file (one thread)."""
+    raw = read_json(CHAT_FILE, 'Chat history', (list, dict))
+    if isinstance(raw, list):                      # legacy format: a single flat conversation
+        messages = [m for m in map(clean_message, raw) if m]
+        if not messages:
+            return []
+        stamp = messages[-1]['at'] or now_stamp()
+        thread = {'id': uuid.uuid4().hex, 'title': thread_title_from(messages), 'created_at': stamp,
+                  'updated_at': stamp, 'messages': messages[-MAX_CHAT_MESSAGES:]}
+        save_threads([thread])   # persist the migration once so the thread id stays stable
+        return [thread]
+    threads = [t for t in map(clean_thread, (raw or {}).get('threads') or []) if t]
+    return sorted(threads, key=lambda t: t['updated_at'], reverse=True)
+
+def save_threads(threads):
+    return write_json_atomic(CHAT_FILE, {'version': 2, 'threads': threads}, 'Chat history')
+
+def thread_title_from(messages):
+    first_user = next((m['content'] for m in messages if m['type'] == 'user'), '')
+    title = ' '.join(first_user.split())
+    return (title[:40] + '…') if len(title) > 40 else (title or DEFAULT_THREAD_TITLE)
+
+def find_thread(threads, thread_id):
+    return next((t for t in threads if t['id'] == thread_id), None)
+
+def append_chat_messages(thread_id, new_messages):
+    """Append to a thread (creating it if the id is unknown); returns the thread id."""
     with STORE_LOCK:
-        history = load_chat_history() + new_messages
-        write_json_atomic(CHAT_FILE, history[-MAX_CHAT_MESSAGES:], 'Chat history')
+        threads = load_threads()
+        thread = find_thread(threads, thread_id)
+        if thread is None:
+            thread = make_thread()
+            threads.append(thread)
+        thread['messages'] = (thread['messages'] + new_messages)[-MAX_CHAT_MESSAGES:]
+        thread['updated_at'] = now_stamp()
+        if thread['title'] == DEFAULT_THREAD_TITLE:
+            thread['title'] = thread_title_from(thread['messages'])
+        save_threads(threads)
+        return thread['id']
 
 def make_chat_message(kind, content):
-    return {'type': kind, 'content': content, 'at': datetime.now().strftime('%Y-%m-%d %H:%M')}
+    return {'type': kind, 'content': content, 'at': now_stamp()}
 
-def render_chat_messages(history):
+def render_chat_messages(messages):
     """Messages for the template. AI text is markdown with raw HTML escaped (it is model/imported output)."""
     return [
         {'type': m['type'], 'at': m.get('at', ''),
          'content': markdown(m['content'], safe_mode='escape') if m['type'] == 'ai' else m['content']}
-        for m in history
+        for m in messages
     ]
 
-# Chat route
+# Chat routes
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    username = getuser()
-    if request.method != 'POST':
-        return render_template('chat.html', messages=render_chat_messages(load_chat_history()), username=username)
+    if request.method == 'POST':
+        thread_id = request.form.get('thread', '')
+        user_message = request.form.get('text_input', '').strip()
+        if user_message:
+            thread = find_thread(load_threads(), thread_id)
+            history = thread['messages'] if thread else []
+            try:
+                answer = chat_engine.ask(user_message, history)
+            except ChatUnavailable as e:
+                answer = str(e)
+            except Exception as e:
+                print(f"Chat error: {e}")
+                answer = ('The assistant could not answer. Make sure Ollama is running with the '
+                          f'`{LLM_MODEL}` model pulled, then try again.')
+            thread_id = append_chat_messages(
+                thread_id, [make_chat_message('user', user_message), make_chat_message('ai', answer)]
+            )
+        # Post/redirect/get: refreshing the page must not re-ask the question.
+        return redirect(url_for('chat', thread=thread_id) if thread_id else url_for('chat'))
 
-    user_message = request.form.get('text_input', '').strip()
-    if user_message:
-        try:
-            answer = chat_engine.ask(user_message)
-        except ChatUnavailable as e:
-            answer = str(e)
-        except Exception as e:
-            print(f"Chat error: {e}")
-            answer = ('The assistant could not answer. Make sure Ollama is running with the '
-                      f'`{LLM_MODEL}` model pulled, then try again.')
-        append_chat_messages([make_chat_message('user', user_message), make_chat_message('ai', answer)])
-    # Post/redirect/get: refreshing the page must not re-ask the question.
+    threads = load_threads()
+    current = find_thread(threads, request.args.get('thread', '')) or (threads[0] if threads else None)
+    return render_template(
+        'chat.html',
+        username=getuser(),
+        threads=threads,
+        current=current,
+        messages=render_chat_messages(current['messages']) if current else [],
+    )
+
+@app.route('/chat/new', methods=['POST'])
+def new_chat():
+    with STORE_LOCK:
+        threads = load_threads()
+        # Reuse an untouched empty thread instead of piling up blank ones.
+        thread = next((t for t in threads if not t['messages']), None)
+        if thread is None:
+            thread = make_thread()
+            threads.append(thread)
+            save_threads(threads)
+    return redirect(url_for('chat', thread=thread['id']))
+
+@app.route('/chat/rename', methods=['POST'])
+def rename_chat():
+    title = ' '.join(request.form.get('title', '').split())[:80]
+    thread_id = request.form.get('thread', '')
+    if title:
+        with STORE_LOCK:
+            threads = load_threads()
+            thread = find_thread(threads, thread_id)
+            if thread:
+                thread['title'] = title
+                save_threads(threads)
+    return redirect(url_for('chat', thread=thread_id))
+
+@app.route('/chat/delete', methods=['POST'])
+def delete_chat():
+    thread_id = request.form.get('thread', '')
+    with STORE_LOCK:
+        threads = [t for t in load_threads() if t['id'] != thread_id]
+        save_threads(threads)
     return redirect(url_for('chat'))
 
 @app.route('/chat/clear', methods=['POST'])
 def clear_chat():
+    """Empty one thread's messages (keeps the thread itself)."""
+    thread_id = request.form.get('thread', '')
     with STORE_LOCK:
-        write_json_atomic(CHAT_FILE, [], 'Chat history')
-    return redirect(url_for('chat'))
+        threads = load_threads()
+        thread = find_thread(threads, thread_id)
+        if thread:
+            thread['messages'] = []
+            thread['title'] = DEFAULT_THREAD_TITLE
+            save_threads(threads)
+    return redirect(url_for('chat', thread=thread_id))
 
 # Full-data export / import
-EXPORT_VERSION = 1
+EXPORT_VERSION = 2
+SUPPORTED_EXPORT_VERSIONS = (1, 2)   # v1 stored one flat 'chat_history' list
 
 def clean_str(value, limit=100_000):
     return value.strip()[:limit] if isinstance(value, str) else ''
@@ -959,7 +1180,7 @@ def export_data():
         'tasks': load_tasks(),
         'notes': load_notes(),
         'tracks': load_focus_tracks(),
-        'chat_history': load_chat_history(),
+        'chat_threads': load_threads(),
     }
     return Response(
         json.dumps(payload, indent=2),
@@ -969,7 +1190,7 @@ def export_data():
 
 def merge_import(payload):
     """Merge a backup into the current data (never deletes). Returns per-kind counts of added items."""
-    added = {'tasks': 0, 'notes': 0, 'tracks': 0, 'chat_history': 0}
+    added = {'tasks': 0, 'notes': 0, 'tracks': 0, 'chat_messages': 0}
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
 
     with STORE_LOCK:
@@ -1024,20 +1245,30 @@ def merge_import(payload):
         if added['tracks']:
             save_focus_tracks(tracks)
 
-        history = load_chat_history()
-        seen = {(m['type'], m['content'], m.get('at', '')) for m in history}
-        for item in payload.get('chat_history') or []:
-            if not isinstance(item, dict) or item.get('type') not in ('user', 'ai'):
+        incoming = [t for t in map(clean_thread, payload.get('chat_threads') or []) if t]
+        legacy = [m for m in map(clean_message, payload.get('chat_history') or []) if m]   # v1 backups
+        if legacy:
+            incoming.append({**make_thread('Imported chat', legacy), 'title': thread_title_from(legacy)})
+
+        threads = load_threads()
+        by_id = {t['id']: t for t in threads}
+        changed = False
+        for thread in incoming:
+            existing = by_id.get(thread['id'])
+            if existing is None:
+                threads.append(thread)
+                by_id[thread['id']] = thread
+                added['chat_messages'] += len(thread['messages'])
+                changed = True
                 continue
-            message = {'type': item['type'], 'content': clean_str(item.get('content')), 'at': clean_str(item.get('at'), 32)}
-            key = (message['type'], message['content'], message['at'])
-            if message['content'] and key not in seen:
-                history.append(message)
-                seen.add(key)
-                added['chat_history'] += 1
-        if added['chat_history']:
-            history.sort(key=lambda m: m.get('at', ''))
-            write_json_atomic(CHAT_FILE, history[-MAX_CHAT_MESSAGES:], 'Chat history')
+            seen = {(m['type'], m['content'], m['at']) for m in existing['messages']}
+            fresh = [m for m in thread['messages'] if (m['type'], m['content'], m['at']) not in seen]
+            if fresh:
+                existing['messages'] = sorted(existing['messages'] + fresh, key=lambda m: m['at'])[-MAX_CHAT_MESSAGES:]
+                added['chat_messages'] += len(fresh)
+                changed = True
+        if changed:
+            save_threads(threads)
     return added
 
 @app.route('/import', methods=['POST'])
@@ -1052,7 +1283,7 @@ def import_data():
             return jsonify(success=False, error='That file is not valid JSON.')
         if not isinstance(payload, dict) or payload.get('app') != 'zehnnflow':
             return jsonify(success=False, error='That file is not a ZehnnFlow backup.')
-        if payload.get('version') != EXPORT_VERSION:
+        if payload.get('version') not in SUPPORTED_EXPORT_VERSIONS:
             return jsonify(success=False, error='Unsupported backup version.')
         return jsonify(success=True, added=merge_import(payload))
     except Exception as e:

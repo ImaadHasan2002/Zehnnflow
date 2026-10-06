@@ -155,8 +155,8 @@ def test_chat_index_cached_until_files_change(zf, client, monkeypatch):
     engine = zf.ChatEngine()
 
     class FakeIndex:
-        def as_query_engine(self, llm):
-            return type('QE', (), {'query': staticmethod(lambda q: 'answer')})()
+        def as_chat_engine(self, **kwargs):
+            return type('CE', (), {'chat': staticmethod(lambda q, chat_history=None: 'answer')})()
 
     monkeypatch.setattr(engine, '_get_models', lambda: ('llm', 'embed'))
     import types
@@ -169,6 +169,10 @@ def test_chat_index_cached_until_files_change(zf, client, monkeypatch):
     monkeypatch.setitem(sys.modules, 'llama_index', types.ModuleType('llama_index'))
     monkeypatch.setitem(sys.modules, 'llama_index.core', core)
     monkeypatch.setitem(sys.modules, 'llama_index.core.readers', readers)
+    llms = types.ModuleType('llama_index.core.llms')
+    llms.ChatMessage = lambda role, content: (role, content)
+    llms.MessageRole = type('MR', (), {'USER': 'user', 'ASSISTANT': 'assistant'})
+    monkeypatch.setitem(sys.modules, 'llama_index.core.llms', llms)
 
     zf.ensure_app_directories()
     (zf.DATA_DIR / 'a.txt').write_text('one')
@@ -188,11 +192,14 @@ def test_email_states(zf, client, monkeypatch):
     monkeypatch.setenv('EMAIL_ADDRESS', 'me@example.com')
     monkeypatch.setenv('GOOGLE_APP_PASSWORD', 'secret')
 
-    class BadIMAP:
+    class RejectingIMAP:
         def __init__(self, *a, **k):
+            pass
+
+        def login(self, *a):
             raise imaplib.IMAP4.error('bad creds')
 
-    monkeypatch.setattr(zf.imaplib, 'IMAP4_SSL', BadIMAP)
+    monkeypatch.setattr(zf.imaplib, 'IMAP4_SSL', RejectingIMAP)
     assert b'Gmail rejected the login' in client.get('/email').data
 
     page = client.post('/email', data={'to_email': 'nope', 'subject': 's', 'body': 'b'})
@@ -275,36 +282,70 @@ def test_inbox_cached_then_refreshed(zf, client, monkeypatch):
     assert len(calls) == 2          # refresh bypasses it
 
 
-def test_inbox_errors_are_not_cached(zf, monkeypatch):
-    attempts = []
-
-    def fail():
-        attempts.append(1)
-        raise zf.EmailError('boom')
-
-    monkeypatch.setattr(zf, 'login_to_email', fail)
-    assert zf.fetch_inbox() == ([], 'boom')
-    zf.fetch_inbox()
-    assert len(attempts) == 2
+def test_chat_creates_thread_and_persists(zf, client):
+    r = client.post('/chat', data={'text_input': 'hello there'})
+    assert r.status_code == 302 and '/chat?thread=' in r.headers['Location']
+    page = client.get(r.headers['Location']).data
+    assert b'hello there' in page and b'No data found' in page
+    threads = zf.load_threads()
+    assert len(threads) == 1 and threads[0]['title'] == 'hello there' and len(threads[0]['messages']) == 2
+    assert client.post('/chat', data={'text_input': '  ', 'thread': threads[0]['id']}).status_code == 302
+    assert len(zf.load_threads()[0]['messages']) == 2          # blank input is not stored
 
 
-def test_chat_history_persists_and_clears(zf, client):
-    r = client.post('/chat', data={'text_input': 'hello'})
-    assert r.status_code == 302                       # post/redirect/get
-    page = client.get('/chat').data
-    assert b'hello' in page and b'No data found' in page
-    assert len(zf.load_chat_history()) == 2
-    assert client.post('/chat', data={'text_input': '  '}).status_code == 302
-    assert len(zf.load_chat_history()) == 2           # blank input is not stored
-    client.post('/chat/clear')
-    assert zf.load_chat_history() == []
+def test_threads_are_independent_and_receive_their_own_history(zf, client, monkeypatch):
+    seen = []
+    monkeypatch.setattr(zf.chat_engine, 'ask', lambda msg, history=(): seen.append((msg, [m['content'] for m in history])) or f're:{msg}')
+
+    t1 = client.post('/chat', data={'text_input': 'first'}).headers['Location'].split('=')[1]
+    client.post('/chat', data={'text_input': 'follow up', 'thread': t1})
+    t2 = client.post('/chat/new').headers['Location'].split('=')[1]
+    client.post('/chat', data={'text_input': 'other topic', 'thread': t2})
+
+    assert seen[1] == ('follow up', ['first', 're:first'])      # same thread: context carried over
+    assert seen[2] == ('other topic', [])                       # new thread: no leakage
+    threads = {t['id']: t for t in zf.load_threads()}
+    assert len(threads) == 2 and len(threads[t1]['messages']) == 4 and len(threads[t2]['messages']) == 2
+    assert b'other topic' in client.get(f'/chat?thread={t2}').data
+    assert b'follow up' not in client.get(f'/chat?thread={t2}').data
 
 
-def test_chat_history_is_capped_and_html_escaped(zf, client):
-    zf.append_chat_messages([zf.make_chat_message('ai', f'm{i}') for i in range(zf.MAX_CHAT_MESSAGES + 5)])
-    assert len(zf.load_chat_history()) == zf.MAX_CHAT_MESSAGES
-    zf.write_json_atomic(zf.CHAT_FILE, [{'type': 'ai', 'content': '<script>alert(1)</script> **ok**'}], 'x')
-    page = client.get('/chat').data
+def test_new_chat_reuses_empty_thread_and_rename_delete_clear(zf, client):
+    t = client.post('/chat/new').headers['Location'].split('=')[1]
+    assert client.post('/chat/new').headers['Location'].endswith(t)      # no pile of blank threads
+    assert len(zf.load_threads()) == 1
+
+    client.post('/chat', data={'text_input': 'q', 'thread': t})
+    client.post('/chat/rename', data={'thread': t, 'title': '  My   topic '})
+    assert zf.load_threads()[0]['title'] == 'My topic'
+    client.post('/chat/clear', data={'thread': t})
+    assert zf.load_threads()[0]['messages'] == [] and zf.load_threads()[0]['title'] == 'New chat'
+    client.post('/chat/delete', data={'thread': t})
+    assert zf.load_threads() == []
+
+
+def test_unknown_thread_id_starts_a_new_thread(zf, client):
+    client.post('/chat', data={'text_input': 'hi', 'thread': 'does-not-exist'})
+    assert len(zf.load_threads()) == 1
+
+
+def test_legacy_flat_chat_history_is_migrated_with_a_stable_id(zf, client):
+    zf.CHAT_FILE.write_text(zf.json.dumps([
+        {'type': 'user', 'content': 'old question', 'at': '2026-01-01 10:00'},
+        {'type': 'ai', 'content': 'old answer', 'at': '2026-01-01 10:00'},
+        {'type': 'bogus', 'content': 'dropped'},
+    ]))
+    first = zf.load_threads()
+    assert len(first) == 1 and first[0]['title'] == 'old question' and len(first[0]['messages']) == 2
+    assert zf.load_threads()[0]['id'] == first[0]['id']                 # persisted, so links stay valid
+    assert b'old answer' in client.get('/chat').data
+
+
+def test_chat_messages_are_capped_per_thread_and_html_escaped(zf, client):
+    tid = zf.append_chat_messages('', [zf.make_chat_message('ai', f'm{i}') for i in range(zf.MAX_CHAT_MESSAGES + 5)])
+    assert len(zf.load_threads()[0]['messages']) == zf.MAX_CHAT_MESSAGES
+    zf.save_threads([{**zf.load_threads()[0], 'messages': [{'type': 'ai', 'content': '<script>alert(1)</script> **ok**', 'at': ''}]}])
+    page = client.get(f'/chat?thread={tid}').data
     assert b'<script>alert(1)</script>' not in page and b'<strong>ok</strong>' in page
 
 
@@ -313,7 +354,7 @@ def test_export_import_roundtrip_merges_without_duplicates(zf, client, tmp_path)
     task_id = add(client, 'keep me')
     client.post('/toggle_task', data={'id': add(client, 'done')})
     client.post('/notes/add', json={'title': 'N', 'content': 'body'})
-    zf.append_chat_messages([zf.make_chat_message('user', 'q'), zf.make_chat_message('ai', 'a')])
+    zf.append_chat_messages('', [zf.make_chat_message('user', 'q'), zf.make_chat_message('ai', 'a')])
     backup = client.get('/export').data
 
     # importing onto the same install adds nothing
@@ -325,9 +366,10 @@ def test_export_import_roundtrip_merges_without_duplicates(zf, client, tmp_path)
     for f in zf.NOTES_DIR.glob('note_*.txt'):
         f.unlink()
     r = client.post('/import', data={'backup_file': (io.BytesIO(backup), 'b.json')}).json
-    assert r['added']['tasks'] == 2 and r['added']['notes'] == 1 and r['added']['chat_history'] == 2
+    assert r['added']['tasks'] == 2 and r['added']['notes'] == 1 and r['added']['chat_messages'] == 2
     assert any(t['id'] == task_id for t in zf.load_tasks())
     assert len(list(zf.NOTES_DIR.glob('note_*.txt'))) == 1
+    assert len(zf.load_threads()) == 1 and len(zf.load_threads()[0]['messages']) == 2
 
 
 def test_import_rejects_bad_files_and_sanitizes(zf, client):
@@ -348,7 +390,7 @@ def test_import_rejects_bad_files_and_sanitizes(zf, client):
         'chat_history': [{'type': 'system', 'content': 'x'}, {'type': 'ai', 'content': '<b>hi</b>'}],
     }
     r = send(zf.json.dumps(evil).encode())
-    assert r['added'] == {'tasks': 1, 'notes': 1, 'tracks': 1, 'chat_history': 1}
+    assert r['added'] == {'tasks': 1, 'notes': 1, 'tracks': 1, 'chat_messages': 1}   # v1 flat history -> one thread
 
 
 def test_quote_is_not_fetched_on_page_load_and_is_cached(zf, client, monkeypatch):
@@ -397,3 +439,180 @@ def test_desktop_mode_falls_back_to_web_when_no_gui_toolkit(zf, monkeypatch):
     monkeypatch.setattr(zf, 'run_web', lambda *a, **k: served.append(1))
     zf.run_desktop()
     assert served == [1]
+
+
+class Clock:
+    """Stand-in for the time module: manual monotonic clock, recorded sleeps."""
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+    def monotonic(self):
+        return self.now
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+
+@pytest.fixture
+def clock(zf, monkeypatch):
+    c = Clock()
+    monkeypatch.setattr(zf, 'time', c)
+    monkeypatch.setattr(zf, '_sleep', c.sleep)
+    return c
+
+
+def test_retries_transient_errors_with_exponential_backoff(zf, clock):
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise zf.TransientEmailError('blip')
+        return 'ok'
+
+    assert zf.call_with_retries(flaky) == 'ok'
+    assert len(attempts) == 3 and clock.slept == [1.0, 2.0]
+
+
+def test_gives_up_after_max_attempts_and_never_retries_permanent_errors(zf, clock):
+    n = []
+    def always():
+        n.append(1)
+        raise zf.TransientEmailError('down')
+    with pytest.raises(zf.TransientEmailError):
+        zf.call_with_retries(always)
+    assert len(n) == 3 and clock.slept == [1.0, 2.0]       # no sleep after the last attempt
+
+    n.clear()
+    def bad_password():
+        n.append(1)
+        raise zf.EmailError('rejected')
+    with pytest.raises(zf.EmailError):
+        zf.call_with_retries(bad_password)
+    assert len(n) == 1
+
+
+def test_smtp_error_classification(zf):
+    smtplib = zf.smtplib
+    assert zf.is_transient_smtp_error(smtplib.SMTPServerDisconnected())
+    assert zf.is_transient_smtp_error(TimeoutError())
+    assert zf.is_transient_smtp_error(smtplib.SMTPResponseException(451, b'try later'))
+    # SMTPException subclasses OSError, so these must NOT count as transient
+    assert not zf.is_transient_smtp_error(smtplib.SMTPAuthenticationError(535, b'bad'))
+    assert not zf.is_transient_smtp_error(smtplib.SMTPRecipientsRefused({}))
+    assert not zf.is_transient_smtp_error(smtplib.SMTPResponseException(550, b'no'))
+
+
+def test_send_retries_connect_but_never_resends(zf, clock, monkeypatch):
+    monkeypatch.setenv('EMAIL_ADDRESS', 'me@example.com')
+    monkeypatch.setenv('GOOGLE_APP_PASSWORD', 'pw')
+    connects, sends = [], []
+
+    class FakeSMTP:
+        def __init__(self, *a, **k):
+            connects.append(1)
+            if len(connects) < 3:
+                raise OSError('timed out')
+        def starttls(self): pass
+        def login(self, *a): pass
+        def sendmail(self, *a): sends.append(1)
+        def quit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(zf.smtplib, 'SMTP', FakeSMTP)
+    zf.send_email('you@example.com', 's', 'b')
+    assert len(connects) == 3 and len(sends) == 1 and clock.slept == [1.0, 2.0]
+
+    # a drop *during* sendmail is ambiguous: must not retry (could double-send)
+    connects.clear(); sends.clear()
+    class DropsMidSend(FakeSMTP):
+        def __init__(self, *a, **k): connects.append(1)
+        def sendmail(self, *a):
+            sends.append(1)
+            raise zf.smtplib.SMTPServerDisconnected('gone')
+    monkeypatch.setattr(zf.smtplib, 'SMTP', DropsMidSend)
+    with pytest.raises(zf.EmailError, match='Sent folder'):
+        zf.send_email('you@example.com', 's', 'b')
+    assert len(sends) == 1
+
+
+def test_send_does_not_retry_bad_password(zf, clock, monkeypatch):
+    monkeypatch.setenv('EMAIL_ADDRESS', 'me@example.com')
+    monkeypatch.setenv('GOOGLE_APP_PASSWORD', 'pw')
+    logins = []
+
+    class BadLogin:
+        def __init__(self, *a, **k): pass
+        def starttls(self): pass
+        def login(self, *a):
+            logins.append(1)
+            raise zf.smtplib.SMTPAuthenticationError(535, b'nope')
+        def close(self): pass
+
+    monkeypatch.setattr(zf.smtplib, 'SMTP', BadLogin)
+    with pytest.raises(zf.EmailError, match='app password'):
+        zf.send_email('you@example.com', 's', 'b')
+    assert len(logins) == 1 and clock.slept == []
+
+
+def test_inbox_cooldown_grows_then_refresh_bypasses_and_success_resets(zf, clock, monkeypatch):
+    fetches = []
+    outcome = {'fail': True}
+
+    def fake_once():
+        fetches.append(1)
+        if outcome['fail']:
+            raise zf.TransientEmailError('down')
+        return ['mail']
+
+    monkeypatch.setattr(zf, 'fetch_inbox_once', fake_once)
+
+    assert zf.fetch_inbox() == ([], 'down')
+    assert len(fetches) == 3                       # 3 attempts inside one call
+    clock.now += 5                                 # within the 15s cooldown: fail fast, no network
+    assert zf.fetch_inbox() == ([], 'down') and len(fetches) == 3
+    clock.now += 11                                # cooldown over -> tries again (and cooldown doubles to 30s)
+    zf.fetch_inbox()
+    assert len(fetches) == 6
+    clock.now += 20
+    zf.fetch_inbox()
+    assert len(fetches) == 6                       # still cooling down (30s)
+    zf.fetch_inbox(force=True)                     # Refresh link ignores the cooldown
+    assert len(fetches) == 9
+
+    outcome['fail'] = False
+    assert zf.fetch_inbox(force=True) == (['mail'], None)
+    assert zf.fetch_inbox() == (['mail'], None)    # cached again
+    assert zf._inbox_cache['failures'] == 0
+
+
+def test_inbox_cooldown_is_capped(zf, clock, monkeypatch):
+    monkeypatch.setattr(zf, 'fetch_inbox_once', lambda: (_ for _ in ()).throw(zf.EmailError('rejected')))
+    for _ in range(12):
+        zf.fetch_inbox(force=True)
+    wait = zf._inbox_cache['retry_after'] - clock.now
+    assert wait == zf.INBOX_COOLDOWN_MAX
+
+
+def test_missing_credentials_never_trigger_a_cooldown(zf, clock):
+    for _ in range(3):
+        assert zf.fetch_inbox()[1] == zf.MISSING_CREDENTIALS_MESSAGE
+    assert zf._inbox_cache['failures'] == 0 and zf._inbox_cache['error'] is None
+
+
+def test_import_merges_threads_by_id_without_duplicating_messages(zf, client):
+    import io
+    tid = zf.append_chat_messages('', [zf.make_chat_message('user', 'q'), zf.make_chat_message('ai', 'a')])
+    backup = client.get('/export').data
+    zf.append_chat_messages(tid, [zf.make_chat_message('user', 'later')])        # local changes after the backup
+    r = client.post('/import', data={'backup_file': (io.BytesIO(backup), 'b.json')}).json
+    assert r['added']['chat_messages'] == 0
+    assert len(zf.load_threads()) == 1 and len(zf.load_threads()[0]['messages']) == 3
+
+    other = {'app': 'zehnnflow', 'version': 2, 'chat_threads': [
+        {'id': tid, 'messages': [{'type': 'user', 'content': 'from laptop', 'at': '2030-01-01 00:00'}]},
+        {'id': 'new-thread', 'title': 'Elsewhere', 'messages': [{'type': 'user', 'content': 'hi', 'at': ''}]},
+    ]}
+    r = client.post('/import', data={'backup_file': (io.BytesIO(zf.json.dumps(other).encode()), 'b.json')}).json
+    assert r['added']['chat_messages'] == 2
+    threads = {t['id']: t for t in zf.load_threads()}
+    assert threads['new-thread']['title'] == 'Elsewhere' and len(threads[tid]['messages']) == 4

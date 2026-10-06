@@ -561,3 +561,64 @@ button:hover,
     text-decoration: line-through;
     opacity: 0.7;
 }
+
+#todo-list .task-item[draggable='true'] {
+    cursor: grab;
+}
+
+.task-item.dragging {
+    opacity: 0.45;
+    cursor: grabbing;
+}
+
+.thread-list {
+    list-style: none;
+    margin: 0.75rem 0;
+    padding: 0;
+    display: grid;
+    gap: 0.4rem;
+}
+
+.thread-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    border: 1px solid var(--border-soft);
+    border-radius: 0.6rem;
+    padding: 0.4rem 0.6rem;
+}
+
+.thread-item.active {
+    background-color: var(--bg-secondary);
+    border-color: currentColor;
+}
+
+.thread-link {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+    text-decoration: none;
+    color: inherit;
+}
+
+.thread-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.thread-meta {
+    font-size: 0.75rem;
+    opacity: 0.7;
+}
+
+.rename-form {
+    display: flex;
+    gap: 0.4rem;
+}
+
+.rename-form input {
+    flex: 1;
+    min-width: 0;
+}
