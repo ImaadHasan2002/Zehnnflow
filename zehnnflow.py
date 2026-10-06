@@ -13,7 +13,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from getpass import getuser
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -238,7 +238,7 @@ def extract_text_from_pdfs(directory):
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for pdf_path in sorted(directory.glob('*.pdf')) + sorted(directory.glob('*.PDF')):
+    for pdf_path in sorted(p for p in directory.rglob('*') if p.suffix.lower() == '.pdf'):
         txt_path = pdf_path.with_suffix('.txt')
         try:
             if txt_path.exists() and txt_path.stat().st_mtime >= pdf_path.stat().st_mtime:
@@ -413,7 +413,6 @@ def get_embed_provider(raw_url):
         return 'youtube', f'{youtube_embed}?autoplay=1&rel=0'
 
     if host_matches(host, 'soundcloud.com'):
-        from urllib.parse import quote
         return 'soundcloud', f'https://w.soundcloud.com/player/?url={quote(raw_url, safe="")}&auto_play=true'
 
     if host_matches(host, 'spotify.com') and parsed_url.path.strip('/'):

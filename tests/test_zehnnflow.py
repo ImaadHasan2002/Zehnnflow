@@ -114,7 +114,6 @@ def test_chat_index_cached_until_files_change(zf, client, monkeypatch):
             return type('QE', (), {'query': staticmethod(lambda q: 'answer')})()
 
     monkeypatch.setattr(engine, '_get_models', lambda: ('llm', 'embed'))
-    fake_modules = {}
     import types
     core = types.ModuleType('llama_index.core')
     core.VectorStoreIndex = type('VSI', (), {
