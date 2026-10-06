@@ -297,7 +297,7 @@ button:hover,
 }
 
 .hidden {
-    display: none;
+    display: none !important;
 }
 
 .status-message {
@@ -524,4 +524,40 @@ button:hover,
         flex-direction: column;
         align-items: flex-start;
     }
+}
+
+.note-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+#notes-search,
+.task-edit-input {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.note-edit-form {
+    display: grid;
+    gap: 0.5rem;
+}
+
+.task-actions {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.completed-section {
+    margin-top: 1rem;
+}
+
+.completed-section summary {
+    cursor: pointer;
+    margin-bottom: 0.6rem;
+}
+
+.task-item.completed .task-text {
+    text-decoration: line-through;
+    opacity: 0.7;
 }

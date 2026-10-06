@@ -22,7 +22,7 @@
         <section class='panel-card chat-panel'>
             <div class='panel-header'>
                 <h1>Chat with Llama 3</h1>
-                <p>Ask questions grounded in your `data/` files and synced notes.</p>
+                <p>Ask questions grounded in your `data/` files and synced notes. Your conversation is saved.</p>
             </div>
 
             <div id='chat-messages' class='chat-messages'>
@@ -63,6 +63,11 @@
                 >
                 <button id='send-btn' type='submit'>Send</button>
             </form>
+            {% if messages %}
+            <form action='{{ url_for("clear_chat") }}' method='POST' onsubmit="return confirm('Clear the whole chat history?');">
+                <button type='submit' class='secondary-btn'>Clear history</button>
+            </form>
+            {% endif %}
         </section>
 
         <aside class='panel-card tts-panel'>

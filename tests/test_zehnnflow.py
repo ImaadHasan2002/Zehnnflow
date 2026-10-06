@@ -50,12 +50,57 @@ def test_main_web_mode_does_not_need_webview(zf, monkeypatch):
     assert zf.DATA_DIR.exists()
 
 
-def test_tasks_roundtrip_and_corrupt_file_is_preserved(zf, client):
-    assert client.post('/add_task', data={'task': 'write tests'}).json['success']
-    assert zf.load_tasks() == [{'text': 'write tests', 'completed': False}]
-    assert client.post('/toggle_task', data={'index': '0'}).json['success']
-    assert zf.load_tasks() == []
+def add(client, text):
+    return client.post('/add_task', data={'task': text}).json['task']['id']
 
+
+def test_tasks_complete_archive_restore_clear(zf, client):
+    a, b = add(client, 'a'), add(client, 'b')
+    assert client.post('/toggle_task', data={'id': a}).json['completed'] is True
+    payload = client.get('/tasks').json
+    assert [t['id'] for t in payload['open']] == [b]
+    assert [t['id'] for t in payload['completed']] == [a]
+    assert payload['completed'][0]['completed_at']
+
+    assert client.post('/toggle_task', data={'id': a}).json['completed'] is False   # restore
+    assert [t['id'] for t in client.get('/tasks').json['open']] == [b, a]
+
+    client.post('/toggle_task', data={'id': a})
+    assert client.post('/clear_completed').json['removed'] == 1
+    assert [t['id'] for t in zf.load_tasks()] == [b]
+
+
+def test_task_ids_prevent_wrong_task_from_two_windows(zf, client):
+    a, _, c = add(client, 'a'), add(client, 'b'), add(client, 'c')
+    client.post('/toggle_task', data={'id': a})            # window 1 completes "a"
+    client.post('/toggle_task', data={'id': c})            # window 2 (stale) completes "c"
+    assert [t['text'] for t in zf.load_tasks() if not t['completed']] == ['b']
+    assert not client.post('/toggle_task', data={'id': 'gone'}).json['success']
+
+
+def test_reorder_tasks(zf, client):
+    a, b, c = add(client, 'a'), add(client, 'b'), add(client, 'c')
+    client.post('/toggle_task', data={'id': b})
+    assert client.post('/reorder_tasks', json={'ids': [c, a]}).json['success']
+    assert [t['id'] for t in client.get('/tasks').json['open']] == [c, a]
+    assert [t['id'] for t in client.get('/tasks').json['completed']] == [b]   # archive untouched
+    # stale or malformed orders are rejected, not applied
+    assert not client.post('/reorder_tasks', json={'ids': [c]}).json['success']
+    assert not client.post('/reorder_tasks', json={'ids': [c, a, b]}).json['success']
+    assert not client.post('/reorder_tasks', json={'ids': [c, c]}).json['success']
+    assert not client.post('/reorder_tasks', json={}).json['success']
+    assert [t['id'] for t in client.get('/tasks').json['open']] == [c, a]
+
+
+def test_legacy_tasks_without_ids_are_migrated_once(zf):
+    zf.TASKS_FILE.write_text('[{"text": "old task", "completed": false}, {"nope": 1}]')
+    first = zf.load_tasks()
+    assert len(first) == 1 and first[0]['id']
+    assert zf.load_tasks()[0]['id'] == first[0]['id']          # persisted, stable
+    assert zf.json.loads(zf.TASKS_FILE.read_text())[0]['id'] == first[0]['id']
+
+
+def test_corrupt_tasks_file_is_preserved(zf):
     zf.TASKS_FILE.write_text('{not json')
     assert zf.load_tasks() == []
     assert zf.TASKS_FILE.with_suffix('.json.corrupt').exists()
@@ -100,7 +145,7 @@ def test_pdf_extraction_is_incremental(zf):
 
 
 def test_chat_empty_state_and_no_global_settings(zf, client):
-    response = client.post('/chat', data={'text_input': 'hi'})
+    response = client.post('/chat', data={'text_input': 'hi'}, follow_redirects=True)
     assert b'No data found' in response.data
     assert 'llama_index' not in sys.modules
 
@@ -114,7 +159,6 @@ def test_chat_index_cached_until_files_change(zf, client, monkeypatch):
             return type('QE', (), {'query': staticmethod(lambda q: 'answer')})()
 
     monkeypatch.setattr(engine, '_get_models', lambda: ('llm', 'embed'))
-    fake_modules = {}
     import types
     core = types.ModuleType('llama_index.core')
     core.VectorStoreIndex = type('VSI', (), {
@@ -195,3 +239,161 @@ def test_default_tracks_not_mutated(zf, client):
     before = len(zf.DEFAULT_FOCUS_TRACKS)
     assert client.post('/focus/add_track', json={'title': 'x', 'url': 'https://youtu.be/zzz'}).json['success']
     assert len(zf.DEFAULT_FOCUS_TRACKS) == before
+
+
+def test_update_task(zf, client):
+    task_id = add(client, 'old')
+    assert client.post('/update_task', data={'id': task_id, 'text': ' new '}).json['text'] == 'new'
+    assert zf.load_tasks()[0]['text'] == 'new'
+    assert not client.post('/update_task', data={'id': task_id, 'text': '  '}).json['success']
+    assert not client.post('/update_task', data={'id': 'x', 'text': 'x'}).json['success']
+
+
+def test_update_note_resyncs_dataset(zf, client):
+    note_id = client.post('/notes/add', json={'title': 'A', 'content': 'alpha'}).json['note']['id']
+    data = client.post('/notes/update', json={'note_id': note_id, 'title': 'A2', 'content': 'gamma'}).json
+    assert data['success'] and data['note']['title'] == 'A2'
+    assert 'gamma' in (zf.NOTES_DIR / f'note_{note_id}.txt').read_text()
+    assert zf.load_notes()[0]['content'] == 'gamma'
+    assert not client.post('/notes/update', json={'note_id': note_id, 'content': ' '}).json['success']
+    assert not client.post('/notes/update', json={'note_id': 'nope', 'content': 'x'}).json['success']
+
+
+def test_inbox_cached_then_refreshed(zf, client, monkeypatch):
+    calls = []
+
+    class FakeMail:
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(zf, 'login_to_email', lambda: FakeMail())
+    monkeypatch.setattr(zf, 'get_latest_emails', lambda mail: calls.append(1) or [])
+    zf.fetch_inbox()
+    zf.fetch_inbox()
+    assert len(calls) == 1          # second visit served from cache
+    client.get('/email?refresh=1')
+    assert len(calls) == 2          # refresh bypasses it
+
+
+def test_inbox_errors_are_not_cached(zf, monkeypatch):
+    attempts = []
+
+    def fail():
+        attempts.append(1)
+        raise zf.EmailError('boom')
+
+    monkeypatch.setattr(zf, 'login_to_email', fail)
+    assert zf.fetch_inbox() == ([], 'boom')
+    zf.fetch_inbox()
+    assert len(attempts) == 2
+
+
+def test_chat_history_persists_and_clears(zf, client):
+    r = client.post('/chat', data={'text_input': 'hello'})
+    assert r.status_code == 302                       # post/redirect/get
+    page = client.get('/chat').data
+    assert b'hello' in page and b'No data found' in page
+    assert len(zf.load_chat_history()) == 2
+    assert client.post('/chat', data={'text_input': '  '}).status_code == 302
+    assert len(zf.load_chat_history()) == 2           # blank input is not stored
+    client.post('/chat/clear')
+    assert zf.load_chat_history() == []
+
+
+def test_chat_history_is_capped_and_html_escaped(zf, client):
+    zf.append_chat_messages([zf.make_chat_message('ai', f'm{i}') for i in range(zf.MAX_CHAT_MESSAGES + 5)])
+    assert len(zf.load_chat_history()) == zf.MAX_CHAT_MESSAGES
+    zf.write_json_atomic(zf.CHAT_FILE, [{'type': 'ai', 'content': '<script>alert(1)</script> **ok**'}], 'x')
+    page = client.get('/chat').data
+    assert b'<script>alert(1)</script>' not in page and b'<strong>ok</strong>' in page
+
+
+def test_export_import_roundtrip_merges_without_duplicates(zf, client, tmp_path):
+    import io
+    task_id = add(client, 'keep me')
+    client.post('/toggle_task', data={'id': add(client, 'done')})
+    client.post('/notes/add', json={'title': 'N', 'content': 'body'})
+    zf.append_chat_messages([zf.make_chat_message('user', 'q'), zf.make_chat_message('ai', 'a')])
+    backup = client.get('/export').data
+
+    # importing onto the same install adds nothing
+    r = client.post('/import', data={'backup_file': (io.BytesIO(backup), 'b.json')}).json
+    assert r['success'] and sum(r['added'].values()) == 0
+
+    # importing onto a fresh install restores everything, including the notes dataset files
+    zf.TASKS_FILE.unlink(); zf.NOTES_FILE.unlink(); zf.CHAT_FILE.unlink()
+    for f in zf.NOTES_DIR.glob('note_*.txt'):
+        f.unlink()
+    r = client.post('/import', data={'backup_file': (io.BytesIO(backup), 'b.json')}).json
+    assert r['added']['tasks'] == 2 and r['added']['notes'] == 1 and r['added']['chat_history'] == 2
+    assert any(t['id'] == task_id for t in zf.load_tasks())
+    assert len(list(zf.NOTES_DIR.glob('note_*.txt'))) == 1
+
+
+def test_import_rejects_bad_files_and_sanitizes(zf, client):
+    import io
+    def send(raw):
+        return client.post('/import', data={'backup_file': (io.BytesIO(raw), 'b.json')}).json
+    assert not send(b'not json')['success']
+    assert not send(b'[1,2]')['success']
+    assert not send(b'{"app": "other", "version": 1}')['success']
+    assert not send(b'{"app": "zehnnflow", "version": 99}')['success']
+    assert not client.post('/import').json['success']
+
+    evil = {
+        'app': 'zehnnflow', 'version': 1,
+        'tasks': ['str', {'text': 5}, {'text': 'ok', 'id': 'dup'}, {'text': 'again', 'id': 'dup'}],
+        'notes': [{'content': ''}, {'content': 'n', 'title': 123}],
+        'tracks': [{'title': 'x', 'url': 'javascript:alert(1)'}, {'title': 'ok', 'url': 'https://youtu.be/q'}],
+        'chat_history': [{'type': 'system', 'content': 'x'}, {'type': 'ai', 'content': '<b>hi</b>'}],
+    }
+    r = send(zf.json.dumps(evil).encode())
+    assert r['added'] == {'tasks': 1, 'notes': 1, 'tracks': 1, 'chat_history': 1}
+
+
+def test_quote_is_not_fetched_on_page_load_and_is_cached(zf, client, monkeypatch):
+    calls = []
+
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return [{'q': 'Be here', 'a': 'Someone'}]
+
+    monkeypatch.setattr(zf.requests, 'get', lambda *a, **k: calls.append(1) or Resp())
+    page = client.get('/').data
+    assert calls == [] and b"data-needs-fetch='1'" in page          # page render never hits the network
+    assert client.get('/quote').json['quote'] == '"Be here" - Someone'
+    client.get('/quote')
+    assert len(calls) == 1                                          # cached
+    assert b'Be here' in client.get('/').data
+
+
+def test_quote_failure_backs_off(zf, client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(zf.requests, 'get', lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(OSError('offline')))
+    assert not client.get('/quote').json['success']
+    client.get('/quote')
+    assert len(calls) == 1                                          # no retry storm while offline
+
+
+def test_stale_complete_click_is_idempotent(zf, client):
+    task_id = add(client, 'a')
+    assert client.post('/toggle_task', data={'id': task_id, 'completed': '1'}).json['completed'] is True
+    # a second window that still shows the task as open clicks Complete again
+    assert client.post('/toggle_task', data={'id': task_id, 'completed': '1'}).json['completed'] is True
+    assert zf.load_tasks()[0]['completed'] is True
+    assert client.post('/toggle_task', data={'id': task_id, 'completed': '0'}).json['completed'] is False
+    assert client.post('/toggle_task', data={'id': task_id, 'completed': '0'}).json['completed'] is False
+
+
+def test_desktop_mode_falls_back_to_web_when_no_gui_toolkit(zf, monkeypatch):
+    import types
+    fake = types.ModuleType('webview')
+    fake.create_window = lambda *a, **k: None
+    def boom():
+        raise RuntimeError('You must have either QT or GTK')
+    fake.start = boom
+    monkeypatch.setitem(sys.modules, 'webview', fake)
+    served = []
+    monkeypatch.setattr(zf, 'run_web', lambda *a, **k: served.append(1))
+    zf.run_desktop()
+    assert served == [1]

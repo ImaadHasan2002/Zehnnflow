@@ -6,6 +6,7 @@ import os
 import smtplib
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from email.header import decode_header, make_header
@@ -13,13 +14,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from getpass import getuser
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
 from markdown2 import markdown
-from markupsafe import escape
 
 # Heavy / optional dependencies (llama_index, pymupdf, pywebview) are imported
 # lazily inside the functions that need them, so importing this module (for a
@@ -34,6 +34,7 @@ except ImportError:
 load_dotenv()
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # imports/uploads
 
 BASE_DIR = Path(__file__).resolve().parent
 # Where user data lives. Defaults to the project folder; override with
@@ -44,6 +45,8 @@ NOTES_DIR = DATA_DIR / 'notes'
 TASKS_FILE = HOME_DIR / 'tasks.json'
 NOTES_FILE = HOME_DIR / 'notes.json'
 TRACKS_FILE = HOME_DIR / 'tracks.json'
+CHAT_FILE = HOME_DIR / 'chat_history.json'
+MAX_CHAT_MESSAGES = 200
 
 # Guards read-modify-write cycles on the JSON stores (waitress is multi-threaded).
 STORE_LOCK = threading.RLock()
@@ -162,21 +165,37 @@ def get_latest_emails(mail, count=5):
         print(f"Important email retrieval error: {e}")
         raise EmailError('Could not read your inbox right now. Retry in a moment.')
 
-def fetch_inbox():
-    """Return (emails, error_message); closes the IMAP session either way."""
-    try:
-        mail = login_to_email()
-    except EmailError as e:
-        return [], str(e)
-    try:
-        return get_latest_emails(mail), None
-    except EmailError as e:
-        return [], str(e)
-    finally:
+INBOX_CACHE_SECONDS = 60
+_inbox_cache = {'at': 0.0, 'emails': None}
+_inbox_lock = threading.Lock()
+
+def fetch_inbox(force=False):
+    """Return (emails, error_message), cached for INBOX_CACHE_SECONDS.
+
+    Only successful fetches are cached, so an error is retried on the next visit.
+    ``force=True`` (the Refresh button) bypasses the cache.
+    """
+    with _inbox_lock:
+        fresh = time.monotonic() - _inbox_cache['at'] < INBOX_CACHE_SECONDS
+        if not force and fresh and _inbox_cache['emails'] is not None:
+            return _inbox_cache['emails'], None
+
         try:
-            mail.logout()
-        except Exception:
-            pass
+            mail = login_to_email()
+        except EmailError as e:
+            return [], str(e)
+        try:
+            emails = get_latest_emails(mail)
+        except EmailError as e:
+            return [], str(e)
+        finally:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+        _inbox_cache.update(at=time.monotonic(), emails=emails)
+        return emails, None
 
 # Helper function to extract email body
 def extract_email_body(email_message):
@@ -220,7 +239,7 @@ def email_route():
             except EmailError as e:
                 context['send_error'] = str(e)
 
-    emails, inbox_error = fetch_inbox()
+    emails, inbox_error = fetch_inbox(force=request.args.get('refresh') == '1')
     return render_template('email.html', emails=emails, inbox_error=inbox_error, **context)
 
 def ensure_app_directories():
@@ -238,7 +257,7 @@ def extract_text_from_pdfs(directory):
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for pdf_path in sorted(directory.glob('*.pdf')) + sorted(directory.glob('*.PDF')):
+    for pdf_path in sorted(p for p in directory.rglob('*') if p.suffix.lower() == '.pdf'):
         txt_path = pdf_path.with_suffix('.txt')
         try:
             if txt_path.exists() and txt_path.stat().st_mtime >= pdf_path.stat().st_mtime:
@@ -291,7 +310,18 @@ def write_json_atomic(path, data, label):
 
 # Task management
 def load_tasks():
-    return read_json_list(TASKS_FILE, 'Task')
+    """Load tasks, giving legacy entries (no id) a stable id and persisting that once."""
+    with STORE_LOCK:
+        tasks = [task for task in read_json_list(TASKS_FILE, 'Task') if isinstance(task, dict) and task.get('text')]
+        migrated = False
+        for task in tasks:
+            if not task.get('id'):
+                task['id'] = uuid.uuid4().hex
+                migrated = True
+            task['completed'] = bool(task.get('completed'))
+        if migrated:
+            save_tasks(tasks)
+        return tasks
 
 def save_tasks(tasks):
     return write_json_atomic(TASKS_FILE, tasks, 'Task')
@@ -413,7 +443,6 @@ def get_embed_provider(raw_url):
         return 'youtube', f'{youtube_embed}?autoplay=1&rel=0'
 
     if host_matches(host, 'soundcloud.com'):
-        from urllib.parse import quote
         return 'soundcloud', f'https://w.soundcloud.com/player/?url={quote(raw_url, safe="")}&auto_play=true'
 
     if host_matches(host, 'spotify.com') and parsed_url.path.strip('/'):
@@ -488,57 +517,138 @@ def sync_all_notes_to_dataset():
 def home():
     username = getuser()
     greeting = get_greeting()
-    quote = get_quote()
-    tasks = load_tasks()
-    notes = load_notes()
-    pending_tasks = len(tasks)
+    open_tasks, completed_tasks = split_tasks(load_tasks())
     return render_template(
         'index.html',
         username=username,
         greeting=greeting,
-        quote=quote,
-        tasks=tasks,
-        pending_tasks=pending_tasks,
-        note_count=len(notes),
+        quote=cached_quote() or '',
+        tasks=open_tasks,
+        completed_tasks=completed_tasks,
+        pending_tasks=len(open_tasks),
+        note_count=len(load_notes()),
     )
 
 # Task routes
+def split_tasks(tasks):
+    open_tasks = [task for task in tasks if not task.get('completed')]
+    completed_tasks = [task for task in tasks if task.get('completed')]
+    return open_tasks, completed_tasks
+
+def find_task(tasks, task_id):
+    return next((task for task in tasks if task.get('id') == task_id), None)
+
+def tasks_payload(tasks):
+    open_tasks, completed_tasks = split_tasks(tasks)
+    return {'open': open_tasks, 'completed': completed_tasks}
+
+@app.route('/tasks')
+def list_tasks():
+    return jsonify(success=True, **tasks_payload(load_tasks()))
+
 @app.route('/add_task', methods=['POST'])
 def add_task():
     try:
-        task = request.form.get('task', '').strip()
-        if not task:
+        text = request.form.get('task', '').strip()
+        if not text:
             return jsonify(success=False, error='Task cannot be empty.')
 
         with STORE_LOCK:
             tasks = load_tasks()
-            tasks.append({'text': task, 'completed': False})
+            task = {'id': uuid.uuid4().hex, 'text': text, 'completed': False}
+            tasks.append(task)
             if not save_tasks(tasks):
                 return jsonify(success=False, error='Unable to add task right now.')
-        return jsonify(success=True, index=len(tasks) - 1)
+        return jsonify(success=True, task=task)
     except Exception as e:
         print(f"Add task error: {e}")
         return jsonify(success=False, error='Unable to add task right now.')
 
 @app.route('/toggle_task', methods=['POST'])
 def toggle_task():
+    """Complete an open task (it moves to the completed archive) or restore a completed one."""
     try:
-        index = int(request.form['index'])
         with STORE_LOCK:
             tasks = load_tasks()
-            if index < 0 or index >= len(tasks):
-                return jsonify(success=False, error='Task index out of range.')
+            task = find_task(tasks, request.form.get('id', ''))
+            if task is None:
+                return jsonify(success=False, error='Task not found. Refresh the page.')
 
-            tasks[index]['completed'] = not tasks[index]['completed']
-            if tasks[index]['completed']:
-                del tasks[index]
+            # Clients send the state they want (idempotent, so a stale click from another
+            # window can't flip a task back); omitting it toggles.
+            wanted = request.form.get('completed')
+            was_completed = bool(task.get('completed'))
+            task['completed'] = (wanted == '1') if wanted in ('0', '1') else not was_completed
+            if task['completed'] == was_completed:
+                return jsonify(success=True, completed=task['completed'])
+            if task['completed']:
+                task['completed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+            else:
+                # A restored task rejoins the end of the open list.
+                task.pop('completed_at', None)
+                tasks.remove(task)
+                tasks.append(task)
 
             if not save_tasks(tasks):
                 return jsonify(success=False, error='Unable to update task.')
-        return jsonify(success=True)
+        return jsonify(success=True, completed=task['completed'])
     except Exception as e:
         print(f"Toggle task error: {e}")
         return jsonify(success=False, error='Unable to update task.')
+
+@app.route('/update_task', methods=['POST'])
+def update_task():
+    try:
+        text = request.form.get('text', '').strip()
+        if not text:
+            return jsonify(success=False, error='Task cannot be empty.')
+
+        with STORE_LOCK:
+            tasks = load_tasks()
+            task = find_task(tasks, request.form.get('id', ''))
+            if task is None:
+                return jsonify(success=False, error='Task not found. Refresh the page.')
+            task['text'] = text
+            if not save_tasks(tasks):
+                return jsonify(success=False, error='Unable to update task.')
+        return jsonify(success=True, text=text)
+    except Exception as e:
+        print(f"Update task error: {e}")
+        return jsonify(success=False, error='Unable to update task.')
+
+@app.route('/reorder_tasks', methods=['POST'])
+def reorder_tasks():
+    """Set the order of the open tasks. ``ids`` must list every open task exactly once."""
+    try:
+        ids = (request.get_json(silent=True) or {}).get('ids')
+        if not isinstance(ids, list):
+            return jsonify(success=False, error='Invalid order.')
+
+        with STORE_LOCK:
+            tasks = load_tasks()
+            open_tasks, completed_tasks = split_tasks(tasks)
+            by_id = {task['id']: task for task in open_tasks}
+            if len(ids) != len(set(ids)) or set(ids) != set(by_id):
+                # Another window added/completed a task; make the caller reload.
+                return jsonify(success=False, error='Your list is out of date. Refresh the page.')
+            if not save_tasks([by_id[task_id] for task_id in ids] + completed_tasks):
+                return jsonify(success=False, error='Unable to reorder tasks.')
+        return jsonify(success=True)
+    except Exception as e:
+        print(f"Reorder tasks error: {e}")
+        return jsonify(success=False, error='Unable to reorder tasks.')
+
+@app.route('/clear_completed', methods=['POST'])
+def clear_completed():
+    try:
+        with STORE_LOCK:
+            open_tasks, completed_tasks = split_tasks(load_tasks())
+            if not save_tasks(open_tasks):
+                return jsonify(success=False, error='Unable to clear completed tasks.')
+        return jsonify(success=True, removed=len(completed_tasks))
+    except Exception as e:
+        print(f"Clear completed error: {e}")
+        return jsonify(success=False, error='Unable to clear completed tasks.')
 
 @app.route('/notes')
 def notes():
@@ -562,6 +672,35 @@ def add_note():
         return jsonify(success=True, note=note)
     except Exception as e:
         print(f"Note add error: {e}")
+        return jsonify(success=False, error='Unable to save note.')
+
+@app.route('/notes/update', methods=['POST'])
+def update_note():
+    try:
+        payload = request.get_json(silent=True) or {}
+        note_id = payload.get('note_id', '')
+        title = str(payload.get('title', '')).strip()
+        content = str(payload.get('content', '')).strip()
+        if not note_id:
+            return jsonify(success=False, error='Invalid note id.')
+        if not content:
+            return jsonify(success=False, error='Note content cannot be empty.')
+
+        with STORE_LOCK:
+            notes_data = load_notes()
+            note = next((item for item in notes_data if item.get('id') == note_id), None)
+            if note is None:
+                return jsonify(success=False, error='Note not found.')
+
+            note['title'] = title or note.get('title') or 'Untitled note'
+            note['content'] = content
+            note['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+            if not save_notes(notes_data):
+                return jsonify(success=False, error='Unable to save note.')
+            sync_note_to_dataset(note)
+        return jsonify(success=True, note=note)
+    except Exception as e:
+        print(f"Note update error: {e}")
         return jsonify(success=False, error='Unable to save note.')
 
 @app.route('/notes/delete', methods=['POST'])
@@ -755,34 +894,170 @@ class ChatEngine:
 
 chat_engine = ChatEngine()
 
+# Chat history (persisted so a restart or page reload keeps the conversation)
+def load_chat_history():
+    return [
+        message for message in read_json_list(CHAT_FILE, 'Chat history')
+        if isinstance(message, dict) and message.get('type') in ('user', 'ai') and isinstance(message.get('content'), str)
+    ]
+
+def append_chat_messages(new_messages):
+    with STORE_LOCK:
+        history = load_chat_history() + new_messages
+        write_json_atomic(CHAT_FILE, history[-MAX_CHAT_MESSAGES:], 'Chat history')
+
+def make_chat_message(kind, content):
+    return {'type': kind, 'content': content, 'at': datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+def render_chat_messages(history):
+    """Messages for the template. AI text is markdown with raw HTML escaped (it is model/imported output)."""
+    return [
+        {'type': m['type'], 'at': m.get('at', ''),
+         'content': markdown(m['content'], safe_mode='escape') if m['type'] == 'ai' else m['content']}
+        for m in history
+    ]
+
 # Chat route
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
     username = getuser()
     if request.method != 'POST':
-        return render_template('chat.html', messages=[], username=username)
+        return render_template('chat.html', messages=render_chat_messages(load_chat_history()), username=username)
 
     user_message = request.form.get('text_input', '').strip()
-    if not user_message:
-        return render_template(
-            'chat.html',
-            messages=[{'type': 'ai', 'content': 'Type a message to start the conversation.'}],
-            username=username,
-        )
+    if user_message:
+        try:
+            answer = chat_engine.ask(user_message)
+        except ChatUnavailable as e:
+            answer = str(e)
+        except Exception as e:
+            print(f"Chat error: {e}")
+            answer = ('The assistant could not answer. Make sure Ollama is running with the '
+                      f'`{LLM_MODEL}` model pulled, then try again.')
+        append_chat_messages([make_chat_message('user', user_message), make_chat_message('ai', answer)])
+    # Post/redirect/get: refreshing the page must not re-ask the question.
+    return redirect(url_for('chat'))
 
-    messages = [{'type': 'user', 'content': user_message}]
+@app.route('/chat/clear', methods=['POST'])
+def clear_chat():
+    with STORE_LOCK:
+        write_json_atomic(CHAT_FILE, [], 'Chat history')
+    return redirect(url_for('chat'))
+
+# Full-data export / import
+EXPORT_VERSION = 1
+
+def clean_str(value, limit=100_000):
+    return value.strip()[:limit] if isinstance(value, str) else ''
+
+@app.route('/export')
+def export_data():
+    payload = {
+        'app': 'zehnnflow',
+        'version': EXPORT_VERSION,
+        'exported_at': datetime.now().isoformat(timespec='seconds'),
+        'tasks': load_tasks(),
+        'notes': load_notes(),
+        'tracks': load_focus_tracks(),
+        'chat_history': load_chat_history(),
+    }
+    return Response(
+        json.dumps(payload, indent=2),
+        mimetype='application/json',
+        headers={'Content-Disposition': 'attachment; filename=zehnnflow-backup.json'},
+    )
+
+def merge_import(payload):
+    """Merge a backup into the current data (never deletes). Returns per-kind counts of added items."""
+    added = {'tasks': 0, 'notes': 0, 'tracks': 0, 'chat_history': 0}
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    with STORE_LOCK:
+        tasks = load_tasks()
+        known_ids = {task['id'] for task in tasks}
+        for item in payload.get('tasks') or []:
+            if not isinstance(item, dict) or not clean_str(item.get('text')):
+                continue
+            task_id = clean_str(item.get('id'), 64) or uuid.uuid4().hex
+            if task_id in known_ids:
+                continue
+            task = {'id': task_id, 'text': clean_str(item['text'], 1000), 'completed': bool(item.get('completed'))}
+            if task['completed']:
+                task['completed_at'] = clean_str(item.get('completed_at'), 32) or now
+            tasks.append(task)
+            known_ids.add(task_id)
+            added['tasks'] += 1
+        if added['tasks']:
+            save_tasks(tasks)
+
+        notes_data = load_notes()
+        known_ids = {note.get('id') for note in notes_data}
+        for item in payload.get('notes') or []:
+            if not isinstance(item, dict) or not clean_str(item.get('content')):
+                continue
+            note_id = clean_str(item.get('id'), 64) or uuid.uuid4().hex
+            if note_id in known_ids:
+                continue
+            notes_data.append({
+                'id': note_id,
+                'title': clean_str(item.get('title'), 300) or f'Note {now}',
+                'content': clean_str(item['content']),
+                'updated_at': clean_str(item.get('updated_at'), 32) or now,
+            })
+            known_ids.add(note_id)
+            added['notes'] += 1
+        if added['notes']:
+            save_notes(notes_data)
+            sync_all_notes_to_dataset()
+
+        tracks = load_focus_tracks()
+        known_urls = {track['url'] for track in tracks}
+        for item in payload.get('tracks') or []:
+            if not isinstance(item, dict):
+                continue
+            url, title = clean_str(item.get('url'), 2000), clean_str(item.get('title'), 300)
+            if not url or not title or url in known_urls or not get_embed_provider(url)[0]:
+                continue
+            tracks.append({'title': title, 'url': url})
+            known_urls.add(url)
+            added['tracks'] += 1
+        if added['tracks']:
+            save_focus_tracks(tracks)
+
+        history = load_chat_history()
+        seen = {(m['type'], m['content'], m.get('at', '')) for m in history}
+        for item in payload.get('chat_history') or []:
+            if not isinstance(item, dict) or item.get('type') not in ('user', 'ai'):
+                continue
+            message = {'type': item['type'], 'content': clean_str(item.get('content')), 'at': clean_str(item.get('at'), 32)}
+            key = (message['type'], message['content'], message['at'])
+            if message['content'] and key not in seen:
+                history.append(message)
+                seen.add(key)
+                added['chat_history'] += 1
+        if added['chat_history']:
+            history.sort(key=lambda m: m.get('at', ''))
+            write_json_atomic(CHAT_FILE, history[-MAX_CHAT_MESSAGES:], 'Chat history')
+    return added
+
+@app.route('/import', methods=['POST'])
+def import_data():
     try:
-        messages.append({'type': 'ai', 'content': markdown(chat_engine.ask(user_message))})
-    except ChatUnavailable as e:
-        messages.append({'type': 'ai', 'content': str(escape(e))})
+        uploaded_file = request.files.get('backup_file')
+        if uploaded_file is None or uploaded_file.filename == '':
+            return jsonify(success=False, error='Choose a ZehnnFlow backup (.json) to import.')
+        try:
+            payload = json.loads(uploaded_file.read().decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return jsonify(success=False, error='That file is not valid JSON.')
+        if not isinstance(payload, dict) or payload.get('app') != 'zehnnflow':
+            return jsonify(success=False, error='That file is not a ZehnnFlow backup.')
+        if payload.get('version') != EXPORT_VERSION:
+            return jsonify(success=False, error='Unsupported backup version.')
+        return jsonify(success=True, added=merge_import(payload))
     except Exception as e:
-        print(f"Chat error: {e}")
-        messages.append({
-            'type': 'ai',
-            'content': 'The assistant could not answer. Make sure Ollama is running with the '
-                       f'`{escape(LLM_MODEL)}` model pulled, then try again.',
-        })
-    return render_template('chat.html', messages=messages, username=username)
+        print(f"Import error: {e}")
+        return jsonify(success=False, error='Unable to import backup.')
 
 # Utility functions
 def get_greeting():
@@ -793,16 +1068,38 @@ def get_greeting():
         return 'Good afternoon'
     return 'Good evening'
 
-def get_quote():
-    try:
-        response = requests.get('https://zenquotes.io/api/random', timeout=8)
-        if response.status_code == 200:
+QUOTE_TTL_SECONDS = 6 * 60 * 60
+QUOTE_RETRY_SECONDS = 60
+_quote_state = {'text': None, 'fetched_at': 0.0, 'failed_at': -QUOTE_RETRY_SECONDS}
+_quote_lock = threading.Lock()
+
+def cached_quote():
+    """Last quote we fetched (even if stale), or None. Never touches the network."""
+    return _quote_state['text']
+
+def refresh_quote():
+    """Return a quote, hitting zenquotes at most once per TTL (and once a minute after a failure)."""
+    with _quote_lock:
+        now = time.monotonic()
+        if _quote_state['text'] and now - _quote_state['fetched_at'] < QUOTE_TTL_SECONDS:
+            return _quote_state['text']
+        if now - _quote_state['failed_at'] < QUOTE_RETRY_SECONDS:
+            return _quote_state['text']
+        try:
+            response = requests.get('https://zenquotes.io/api/random', timeout=4)
+            response.raise_for_status()
             quote_data = response.json()[0]
-            return f"\"{quote_data['q']}\" - {quote_data['a']}"
-        return 'Could not retrieve a quote at this time.'
-    except Exception as e:
-        print(f"Quote retrieval error: {e}")
-        return 'Unable to fetch quote'
+            _quote_state.update(text=f"\"{quote_data['q']}\" - {quote_data['a']}", fetched_at=now)
+        except Exception as e:
+            print(f"Quote retrieval error: {e}")
+            _quote_state['failed_at'] = now
+        return _quote_state['text']
+
+@app.route('/quote')
+def random_quote():
+    """Fetched by the home page after it renders, so a slow network never blocks page load."""
+    text = refresh_quote()
+    return jsonify(success=bool(text), quote=text or 'Could not retrieve a quote at this time.')
 
 def run_desktop():
     """Open the app in a native pywebview window (the default experience)."""
@@ -812,8 +1109,13 @@ def run_desktop():
         print('pywebview is not installed; falling back to web mode. Install it for the desktop window.')
         return run_web()
 
-    webview.create_window('ZehnnFlow', app, width=1100, height=820)
-    webview.start()
+    try:
+        webview.create_window('ZehnnFlow', app, width=1100, height=820)
+        webview.start()
+    except Exception as e:
+        # Typically Linux without GTK/Qt ("pip install pywebview[qt]" fixes it).
+        print(f'Could not open the desktop window ({e}). Falling back to web mode.')
+        return run_web()
 
 def run_web(host='127.0.0.1', port=5000):
     """Serve the app over HTTP with waitress (falls back to Flask's dev server)."""

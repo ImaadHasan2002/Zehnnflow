@@ -25,7 +25,7 @@
             <p class='hero-subtitle'>Manage tasks, capture ideas, and keep your flow state alive.</p>
             <div class='stats-grid'>
                 <article class='stat-card'>
-                    <p class='stat-value'>{{ pending_tasks }}</p>
+                    <p id='open-count' class='stat-value'>{{ pending_tasks }}</p>
                     <p class='stat-label'>Open tasks</p>
                 </article>
                 <article class='stat-card'>
@@ -42,7 +42,7 @@
         <section class='panel-card'>
             <div class='panel-header'>
                 <h2>Task list</h2>
-                <p>Mark items complete to keep momentum.</p>
+                <p>Mark items complete to keep momentum. Double-click a task to edit it.</p>
             </div>
 
             <form id='todo-form' class='input-row'>
@@ -53,19 +53,53 @@
 
             <ul id='todo-list' class='task-list'>
                 {% for task in tasks %}
-                    <li data-index='{{ loop.index0 }}' class='task-item {{ "completed" if task.completed }}'>
+                    <li data-id='{{ task.id }}' class='task-item'>
                         <span class='task-text'>{{ task.text }}</span>
-                        <button type='button' class='toggle-btn'>Complete</button>
+                        <span class='task-actions'>
+                            <button type='button' class='secondary-btn move-up-btn' aria-label='Move up'>↑</button>
+                            <button type='button' class='secondary-btn move-down-btn' aria-label='Move down'>↓</button>
+                            <button type='button' class='toggle-btn'>Complete</button>
+                        </span>
                     </li>
                 {% else %}
                     <li class='task-empty'>No tasks yet. Start with one small win.</li>
                 {% endfor %}
             </ul>
+
+            <details id='completed-section' class='completed-section'{% if not completed_tasks %} hidden{% endif %}>
+                <summary>Completed (<span id='completed-count'>{{ completed_tasks|length }}</span>)</summary>
+                <ul id='completed-list' class='task-list'>
+                    {% for task in completed_tasks %}
+                        <li data-id='{{ task.id }}' class='task-item completed'>
+                            <span class='task-text'>{{ task.text }}</span>
+                            <span class='task-actions'>
+                                <button type='button' class='secondary-btn restore-btn'>Restore</button>
+                            </span>
+                        </li>
+                    {% endfor %}
+                </ul>
+                <button type='button' id='clear-completed-btn' class='danger-btn'>Clear completed</button>
+            </details>
         </section>
 
         <section class='quote-card'>
             <h2>Daily quote</h2>
-            <p>{{ quote }}</p>
+            <p id='quote-text' data-needs-fetch='{{ "" if quote else "1" }}'>{{ quote or 'Loading today\'s quote...' }}</p>
+        </section>
+
+        <section class='panel-card'>
+            <div class='panel-header'>
+                <h2>Your data</h2>
+                <p>Back up tasks, notes, focus tracks and chat history to one file, or merge a backup into this install.</p>
+            </div>
+            <div class='button-row'>
+                <a class='secondary-btn' href='{{ url_for("export_data") }}'>Export backup</a>
+                <form id='import-data-form' class='inline-import-form' enctype='multipart/form-data'>
+                    <input id='backup-file' type='file' name='backup_file' accept='.json,application/json' required>
+                    <button type='submit' class='secondary-btn'>Import backup</button>
+                </form>
+            </div>
+            <p id='data-status' class='status-message hidden'></p>
         </section>
     </main>
 
